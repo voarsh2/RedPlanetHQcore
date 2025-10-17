@@ -42,6 +42,8 @@ services:
       - FROM_EMAIL=${FROM_EMAIL}
       - RESEND_API_KEY=${RESEND_API_KEY}
       - COHERE_API_KEY=${COHERE_API_KEY}
+      - GLM_API_KEY=${GLM_API_KEY}
+      - GLM_API_BASE_URL=${GLM_API_BASE_URL}
     ports:
       - "3033:3000"
     depends_on:

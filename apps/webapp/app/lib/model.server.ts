@@ -1,6 +1,5 @@
 import {
   type CoreMessage,
-  type LanguageModelV1,
   embed,
   generateText,
   streamText,
@@ -9,10 +8,12 @@ import { openai } from "@ai-sdk/openai";
 import { logger } from "~/services/logger.service";
 
 import { createOllama, type OllamaProvider } from "ollama-ai-provider";
-import { anthropic } from "@ai-sdk/anthropic";
-import { google } from "@ai-sdk/google";
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+import {
+  resolveProvider,
+  isKnownModel,
+} from "./llm/providers";
 
 export type ModelComplexity = 'high' | 'low';
 
@@ -65,7 +66,6 @@ export async function makeModelCall(
   options?: any,
   complexity: ModelComplexity = 'high',
 ) {
-  let modelInstance: LanguageModelV1 | undefined;
   let model = getModelForTask(complexity);
   const ollamaUrl = process.env.OLLAMA_URL;
   let ollama: OllamaProvider | undefined;
@@ -81,59 +81,31 @@ export async function makeModelCall(
     credentialProvider: fromNodeProviderChain(),
   });
 
-  const generateTextOptions: any = {}
+  const generateTextOptions: Record<string, unknown> = {};
 
   logger.info(
     `complexity: ${complexity}, model: ${model}`,
   );
-  switch (model) {
-    case "gpt-4.1-2025-04-14":
-    case "gpt-4.1-mini-2025-04-14":
-    case "gpt-5-mini-2025-08-07":
-    case "gpt-5-2025-08-07":
-    case "gpt-4.1-nano-2025-04-14":
-      modelInstance = openai(model, { ...options });
-      generateTextOptions.temperature = 1
-      break;
+  const provider = resolveProvider(model, {
+    bedrock,
+    ollama,
+    options,
+  });
 
-    case "claude-3-7-sonnet-20250219":
-    case "claude-3-opus-20240229":
-    case "claude-3-5-haiku-20241022":
-      modelInstance = anthropic(model, { ...options });
-      break;
-
-    case "gemini-2.5-flash-preview-04-17":
-    case "gemini-2.5-pro-preview-03-25":
-    case "gemini-2.0-flash":
-    case "gemini-2.0-flash-lite":
-      modelInstance = google(model, { ...options });
-      break;
-
-    case "us.meta.llama3-3-70b-instruct-v1:0":
-    case "us.deepseek.r1-v1:0":
-    case "qwen.qwen3-32b-v1:0":
-    case "openai.gpt-oss-120b-1:0":
-    case "us.mistral.pixtral-large-2502-v1:0":
-    case "us.amazon.nova-premier-v1:0":
-      modelInstance = bedrock(`${model}`);
-      generateTextOptions.maxTokens = 100000
-      break;
-
-    default:
-      if (ollama) {
-        modelInstance = ollama(model);
-      }
+  if (!provider) {
+    if (!ollama && !isKnownModel(model)) {
       logger.warn(`Unsupported model type: ${model}`);
-      break;
+    }
+    throw new Error(`Unsupported model type: ${model}`);
   }
 
-  if (!modelInstance) {
-    throw new Error(`Unsupported model type: ${model}`);
+  if (provider.defaultOptions) {
+    Object.assign(generateTextOptions, provider.defaultOptions);
   }
 
   if (stream) {
     return streamText({
-      model: modelInstance,
+      model: provider.instance,
       messages,
       ...generateTextOptions,
       onFinish: async ({ text, usage }) => {
@@ -153,7 +125,7 @@ export async function makeModelCall(
   }
 
   const { text, usage } = await generateText({
-    model: modelInstance,
+    model: provider.instance,
     messages,
     ...generateTextOptions,
   });

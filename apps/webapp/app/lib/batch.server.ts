@@ -5,11 +5,13 @@ import {
 } from "./batch/types";
 import { OpenAIBatchProvider } from "./batch/providers/openai";
 import { AnthropicBatchProvider } from "./batch/providers/anthropic";
+import { GLMBatchProvider } from "./batch/providers/glm";
 import { logger } from "~/services/logger.service";
 
 // Global provider instances (singleton pattern)
 let openaiProvider: OpenAIBatchProvider | null = null;
 let anthropicProvider: AnthropicBatchProvider | null = null;
+let glmProvider: GLMBatchProvider | null = null;
 
 function getProvider(modelId: string) {
   // OpenAI models
@@ -26,6 +28,13 @@ function getProvider(modelId: string) {
       anthropicProvider = new AnthropicBatchProvider();
     }
     return anthropicProvider;
+  }
+
+  if (modelId.includes("glm")) {
+    if (!glmProvider) {
+      glmProvider = new GLMBatchProvider();
+    }
+    return glmProvider;
   }
 
   throw new Error(`No batch provider available for model: ${modelId}`);
@@ -126,6 +135,10 @@ export function getSupportedBatchModels() {
 
   if (process.env.ANTHROPIC_API_KEY) {
     models.anthropic = new AnthropicBatchProvider().supportedModels;
+  }
+
+  if (process.env.GLM_API_KEY) {
+    models.glm = new GLMBatchProvider().supportedModels;
   }
 
   return models;

@@ -2,7 +2,6 @@ import { metadata, task } from "@trigger.dev/sdk";
 import { streamText, type CoreMessage, tool } from "ai";
 import { z } from "zod";
 
-import { openai } from "@ai-sdk/openai";
 import { logger } from "~/services/logger.service";
 import {
   deletePersonalAccessToken,
@@ -10,6 +9,10 @@ import {
 } from "../utils/utils";
 import axios from "axios";
 import { nanoid } from "nanoid";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
+import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+import { createOllama } from "ollama-ai-provider";
+import { resolveProvider } from "~/lib/llm/providers";
 
 export const ExtensionSearchBodyRequest = z.object({
   userInput: z.string().min(1, "User input is required"),
@@ -111,15 +114,56 @@ If no relevant information is found at all, provide a brief statement indicating
     ];
 
     try {
+      const model = process.env.MODEL as string;
+      const ollamaUrl = process.env.OLLAMA_URL;
+      let ollamaProvider;
+
+      if (ollamaUrl) {
+        try {
+          ollamaProvider = createOllama({
+            baseURL: ollamaUrl,
+          });
+        } catch (ollamaError) {
+          logger.warn(
+            "Unable to initialise Ollama provider for extension search",
+            { error: ollamaError },
+          );
+        }
+      }
+
+      const bedrock = createAmazonBedrock({
+        region: process.env.AWS_REGION || "us-east-1",
+        credentialProvider: fromNodeProviderChain(),
+      });
+
+      const provider = resolveProvider(model, {
+        bedrock,
+        ollama: ollamaProvider,
+      });
+
+      if (!provider?.instance) {
+        throw new Error(`Unsupported model type for extension search: ${model}`);
+      }
+
+      const defaultOptions =
+        provider.defaultOptions && Object.keys(provider.defaultOptions).length > 0
+          ? { ...provider.defaultOptions }
+          : {};
+
+      const streamOptions = {
+        temperature: 0.3,
+        maxTokens: 1000,
+        ...defaultOptions,
+      };
+
       const result = streamText({
-        model: openai(process.env.MODEL as string),
+        model: provider.instance,
         messages,
         tools: {
           searchMemory: searchMemoryTool,
         },
         maxSteps: 5,
-        temperature: 0.3,
-        maxTokens: 1000,
+        ...streamOptions,
       });
 
       const stream = await metadata.stream("messages", result.textStream);

@@ -13,6 +13,10 @@ export enum LLMModelEnum {
   GEMINI25PRO = "GEMINI25PRO",
   GEMINI20FLASH = "GEMINI20FLASH",
   GEMINI20FLASHLITE = "GEMINI20FLASHLITE",
+  GLM4 = "GLM4",
+  GLM4AIR = "GLM4AIR",
+  GLM4AIRX = "GLM4AIRX",
+  GLM4FLASH = "GLM4FLASH",
 }
 
 export const LLMModelType = {
@@ -30,6 +34,10 @@ export const LLMModelType = {
   GEMINI25PRO: "GEMINI25PRO",
   GEMINI20FLASH: "GEMINI20FLASH",
   GEMINI20FLASHLITE: "GEMINI20FLASHLITE",
+  GLM4: "GLM4",
+  GLM4AIR: "GLM4AIR",
+  GLM4AIRX: "GLM4AIRX",
+  GLM4FLASH: "GLM4FLASH",
 };
 
 export enum LLMMappings {
@@ -47,6 +55,10 @@ export enum LLMMappings {
   GEMINI25PRO = "gemini-2.5-pro-preview-03-25",
   GEMINI20FLASH = "gemini-2.0-flash",
   GEMINI20FLASHLITE = "gemini-2.0-flash-lite",
+  GLM4 = "glm-4",
+  GLM4AIR = "glm-4-air",
+  GLM4AIRX = "glm-4-airx",
+  GLM4FLASH = "glm-4-flash",
 }
 
 export const OpenAIModels = [
@@ -68,6 +80,13 @@ export const GeminiModels = [
   LLMModelEnum.GEMINI25PRO,
   LLMModelEnum.GEMINI20FLASH,
   LLMModelEnum.GEMINI20FLASHLITE,
+];
+
+export const GLMModels = [
+  LLMModelEnum.GLM4,
+  LLMModelEnum.GLM4AIR,
+  LLMModelEnum.GLM4AIRX,
+  LLMModelEnum.GLM4FLASH,
 ];
 
 export type LLMModelType = (typeof LLMModelType)[keyof typeof LLMModelType];

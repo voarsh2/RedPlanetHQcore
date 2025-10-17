@@ -65,7 +65,7 @@ const EnvironmentSchema = z.object({
   NEO4J_PASSWORD: z.string(),
 
   //OpenAI
-  OPENAI_API_KEY: z.string(),
+  OPENAI_API_KEY: z.string().optional(),
 
   EMAIL_TRANSPORT: z.string().optional(),
   FROM_EMAIL: z.string().optional(),
@@ -94,6 +94,8 @@ const EnvironmentSchema = z.object({
   AWS_ACCESS_KEY_ID: z.string().optional(),
   AWS_SECRET_ACCESS_KEY: z.string().optional(),
   AWS_REGION: z.string().optional(),
+  GLM_API_KEY: z.string().optional(),
+  GLM_API_BASE_URL: z.string().default("https://open.bigmodel.cn/api/paas/v4"),
 });
 
 export type Environment = z.infer<typeof EnvironmentSchema>;
