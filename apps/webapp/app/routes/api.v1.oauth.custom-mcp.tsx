@@ -8,6 +8,12 @@ import {
 import { env } from "~/env.server";
 import { logger } from "~/services/logger.service";
 import { z } from "zod";
+import {
+  CUSTOM_MCP_TRANSPORT_STRATEGIES,
+  parseCustomMcpHeadersInput,
+  type CustomMcpHeaderConfig,
+  type CustomMcpTransportStrategy,
+} from "~/utils/mcp/custom-mcp-config";
 
 const MCP_CALLBACK_URL = `${env.APP_ORIGIN}/api/v1/oauth/callback/mcp`;
 
@@ -19,6 +25,8 @@ export const customMcpOAuthSession: Record<
     serverUrl: string;
     name: string;
     redirectURL: string;
+    transportStrategy: CustomMcpTransportStrategy;
+    headers: CustomMcpHeaderConfig[];
     sessionData: CustomMcpOAuthSession;
   }
 > = {};
@@ -27,6 +35,7 @@ const InitiateOAuthSchema = z.object({
   intent: z.literal("initiate"),
   name: z.string().min(1),
   serverUrl: z.string().url(),
+  transportStrategy: z.enum(CUSTOM_MCP_TRANSPORT_STRATEGIES).default("http-first"),
   redirectURL: z.string().optional(),
 });
 
@@ -38,13 +47,27 @@ export async function action({ request }: ActionFunctionArgs) {
   if (intent === "initiate") {
     const name = formData.get("name") as string;
     const serverUrl = formData.get("serverUrl") as string;
+    const transportStrategy = (formData.get("transportStrategy") ||
+      "http-first") as CustomMcpTransportStrategy;
+    const rawHeaders = (formData.get("headers") as string) || "";
     const redirectURL =
       (formData.get("redirectURL") as string) ||
       `${env.APP_ORIGIN}/home/integrations`;
 
     try {
+      const { headers, error } = parseCustomMcpHeadersInput(rawHeaders);
+      if (error) {
+        throw new Error(error);
+      }
+
       // Validate inputs
-      InitiateOAuthSchema.parse({ intent, name, serverUrl, redirectURL });
+      InitiateOAuthSchema.parse({
+        intent,
+        name,
+        serverUrl,
+        transportStrategy,
+        redirectURL,
+      });
 
       const { authUrl, sessionData } = await getCustomMcpAuthorizationUrl({
         serverUrl,
@@ -61,6 +84,8 @@ export async function action({ request }: ActionFunctionArgs) {
         serverUrl,
         name,
         redirectURL,
+        transportStrategy,
+        headers,
         sessionData,
       };
 

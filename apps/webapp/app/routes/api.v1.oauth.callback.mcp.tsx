@@ -5,21 +5,9 @@ import { env } from "~/env.server";
 import { customMcpOAuthSession } from "./api.v1.oauth.custom-mcp";
 import { prisma } from "~/db.server";
 import { updateUser } from "~/models/user.server";
+import { type CustomMcpIntegration as McpIntegration } from "~/utils/mcp/custom-mcp-config";
 
 const MCP_CALLBACK_URL = `${env.APP_ORIGIN}/api/v1/oauth/callback/mcp`;
-
-type McpIntegration = {
-  id: string;
-  name: string;
-  serverUrl: string;
-  oauth?: {
-    accessToken: string;
-    refreshToken?: string;
-    expiresIn?: number;
-    clientId?: string;
-    clientSecret?: string;
-  };
-};
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
@@ -49,7 +37,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
     });
   }
 
-  const { userId, serverUrl, name, redirectURL, sessionData } = session;
+  const {
+    userId,
+    serverUrl,
+    name,
+    redirectURL,
+    sessionData,
+    transportStrategy,
+    headers,
+  } = session;
 
   // Clean up session
   delete customMcpOAuthSession[state];
@@ -81,6 +77,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
       id: crypto.randomUUID(),
       name,
       serverUrl,
+      transportStrategy,
+      ...(headers.length > 0 ? { headers } : {}),
       oauth: {
         accessToken: result.accessToken,
         refreshToken: result.refreshToken,

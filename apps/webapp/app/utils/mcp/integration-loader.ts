@@ -1,17 +1,11 @@
 import { prisma } from "~/db.server";
 import { IntegrationRunner } from "~/services/integrations/integration-runner";
-
-export interface CustomMcpIntegration {
-  id: string;
-  name: string;
-  serverUrl: string;
-  oauth?: {
-    accessToken: string;
-    refreshToken?: string;
-    expiresIn?: number;
-    clientId?: string;
-  };
-}
+import {
+  resolveCustomMcpHeaders,
+  type CustomMcpHeaderConfig,
+  type CustomMcpIntegration,
+  type CustomMcpTransportStrategy,
+} from "./custom-mcp-config";
 
 export interface CustomMcpAccount {
   id: string;
@@ -27,6 +21,9 @@ export interface CustomMcpAccount {
   };
   serverUrl: string;
   accessToken?: string;
+  headers?: Record<string, string>;
+  headerConfig?: CustomMcpHeaderConfig[];
+  transportStrategy?: CustomMcpTransportStrategy;
 }
 
 export interface IntegrationAccountWithDefinition {
@@ -100,12 +97,15 @@ export class IntegrationLoader {
 
     // Convert custom MCPs to the same format as regular integration accounts
     const customMcpAccounts: CustomMcpAccount[] = customMcpIntegrations
-      .filter((mcp) => mcp.oauth?.accessToken) // Only include connected ones
       .map((mcp) => ({
         id: mcp.id,
         accountId: mcp.id,
         integrationConfiguration: {
           accessToken: mcp.oauth?.accessToken,
+          refreshToken: mcp.oauth?.refreshToken,
+          expiresIn: mcp.oauth?.expiresIn,
+          clientId: mcp.oauth?.clientId,
+          clientSecret: mcp.oauth?.clientSecret,
         },
         isActive: true,
         isCustomMcp: true as const,
@@ -117,6 +117,9 @@ export class IntegrationLoader {
         },
         serverUrl: mcp.serverUrl,
         accessToken: mcp.oauth?.accessToken,
+        headers: resolveCustomMcpHeaders(mcp.headers),
+        headerConfig: mcp.headers,
+        transportStrategy: mcp.transportStrategy,
       }));
 
     return [...integrationAccounts, ...customMcpAccounts];
@@ -179,7 +182,7 @@ export class IntegrationLoader {
       []) as CustomMcpIntegration[];
 
     const mcp = customMcpIntegrations.find((m) => m.id === mcpId);
-    if (!mcp || !mcp.oauth?.accessToken) {
+    if (!mcp) {
       return null;
     }
 
@@ -187,10 +190,11 @@ export class IntegrationLoader {
       id: mcp.id,
       accountId: mcp.id,
       integrationConfiguration: {
-        accessToken: mcp.oauth.accessToken,
-        refreshToken: mcp.oauth.refreshToken,
-        expiresIn: mcp.oauth.expiresIn,
-        clientId: mcp.oauth.clientId,
+        accessToken: mcp.oauth?.accessToken,
+        refreshToken: mcp.oauth?.refreshToken,
+        expiresIn: mcp.oauth?.expiresIn,
+        clientId: mcp.oauth?.clientId,
+        clientSecret: mcp.oauth?.clientSecret,
       },
       isActive: true,
       isCustomMcp: true as const,
@@ -201,7 +205,10 @@ export class IntegrationLoader {
         spec: null,
       },
       serverUrl: mcp.serverUrl,
-      accessToken: mcp.oauth.accessToken,
+      accessToken: mcp.oauth?.accessToken,
+      headers: resolveCustomMcpHeaders(mcp.headers),
+      headerConfig: mcp.headers,
+      transportStrategy: mcp.transportStrategy,
     };
   }
 

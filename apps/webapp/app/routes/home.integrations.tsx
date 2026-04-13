@@ -30,6 +30,11 @@ import {
   CardTitle,
 } from "~/components/ui/card";
 import { useToast } from "~/hooks/use-toast";
+import {
+  CUSTOM_MCP_TRANSPORT_STRATEGIES,
+  parseCustomMcpHeadersInput,
+  type CustomMcpTransportStrategy,
+} from "~/utils/mcp/custom-mcp-config";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const userId = await requireUserId(request);
@@ -89,6 +94,9 @@ export async function action({ request }: ActionFunctionArgs) {
         const name = formData.get("name") as string;
         const serverUrl = formData.get("serverUrl") as string;
         const accessToken = formData.get("accessToken") as string | undefined;
+        const transportStrategy = (formData.get("transportStrategy") ||
+          "http-first") as CustomMcpTransportStrategy;
+        const headerConfig = formData.get("headers") as string | undefined;
 
         if (!name || !serverUrl) {
           return json(
@@ -97,10 +105,21 @@ export async function action({ request }: ActionFunctionArgs) {
           );
         }
 
+        if (!CUSTOM_MCP_TRANSPORT_STRATEGIES.includes(transportStrategy)) {
+          return json({ error: "Invalid transport strategy" }, { status: 400 });
+        }
+
+        const { headers, error } = parseCustomMcpHeadersInput(headerConfig || "");
+        if (error) {
+          return json({ error }, { status: 400 });
+        }
+
         const newIntegration: McpIntegration = {
           id: crypto.randomUUID(),
           name,
           serverUrl,
+          transportStrategy,
+          ...(headers.length > 0 ? { headers } : {}),
           ...(accessToken && {
             oauth: {
               accessToken,
@@ -171,6 +190,10 @@ function NewIntegrationForm({
   const localFetcher = useFetcher<{ success: boolean; error?: string }>();
   const [isRedirecting, setIsRedirecting] = useState(false);
   const [accessToken, setAccessToken] = useState("");
+  const [useOAuth, setUseOAuth] = useState(true);
+  const [transportStrategy, setTransportStrategy] =
+    useState<CustomMcpTransportStrategy>("http-first");
+  const [headersInput, setHeadersInput] = useState("");
 
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.redirectURL) {
@@ -188,8 +211,10 @@ function NewIntegrationForm({
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
+    formData.set("transportStrategy", transportStrategy);
+    formData.set("headers", headersInput);
 
-    if (accessToken.trim()) {
+    if (!useOAuth || accessToken.trim()) {
       formData.set("intent", "create");
       formData.set("accessToken", accessToken);
       localFetcher.submit(formData, { method: "post" });
@@ -211,7 +236,8 @@ function NewIntegrationForm({
       <CardHeader className="p-0 pb-4">
         <CardTitle>New Custom Integration</CardTitle>
         <CardDescription>
-          Connect an external MCP server using OAuth or an access token
+          Connect an external MCP server using OAuth, static headers, or no
+          auth
         </CardDescription>
       </CardHeader>
       <CardContent className="p-0">
@@ -241,6 +267,48 @@ function NewIntegrationForm({
           </div>
 
           <div className="space-y-2">
+            <label
+              htmlFor="transportStrategy"
+              className="text-sm font-medium"
+            >
+              Transport
+            </label>
+            <select
+              id="transportStrategy"
+              name="transportStrategy"
+              className="bg-background flex h-10 w-full rounded-md border px-3 py-2 text-sm"
+              value={transportStrategy}
+              onChange={(e) =>
+                setTransportStrategy(
+                  e.target.value as CustomMcpTransportStrategy,
+                )
+              }
+            >
+              <option value="http-first">HTTP first</option>
+              <option value="sse-first">SSE first</option>
+              <option value="http-only">HTTP only</option>
+              <option value="sse-only">SSE only</option>
+            </select>
+            <p className="text-muted-foreground text-xs">
+              Default is HTTP first with automatic fallback when supported.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={useOAuth}
+                onChange={(e) => setUseOAuth(e.target.checked)}
+              />
+              Use OAuth if the MCP server supports it
+            </label>
+            <p className="text-muted-foreground text-xs">
+              Turn this off for API key, static-header, or no-auth MCP servers.
+            </p>
+          </div>
+
+          <div className="space-y-2">
             <label htmlFor="accessToken" className="text-sm font-medium">
               Access Token (optional)
             </label>
@@ -253,8 +321,29 @@ function NewIntegrationForm({
               onChange={(e) => setAccessToken(e.target.value)}
             />
             <p className="text-muted-foreground text-xs">
-              Provide an access token to skip OAuth, or leave empty to
-              authenticate via OAuth
+              Provide a bearer token to skip OAuth. Leave empty if the server
+              uses OAuth, custom headers, or no auth.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <label htmlFor="headers" className="text-sm font-medium">
+              Additional headers (optional)
+            </label>
+            <textarea
+              id="headers"
+              name="headers"
+              className="bg-background flex min-h-28 w-full rounded-md border px-3 py-2 text-sm"
+              placeholder={[
+                "X-API-Key=env:MCP_EXAMPLE_API_KEY",
+                "X-Tenant=acme",
+              ].join("\n")}
+              value={headersInput}
+              onChange={(e) => setHeadersInput(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              One header per line. Use <code>Header=env:MCP_KEY</code> for
+              env-backed secrets. Only <code>MCP_*</code> env vars are allowed.
             </p>
           </div>
 
@@ -277,7 +366,7 @@ function NewIntegrationForm({
                 ? "Connecting..."
                 : isRedirecting
                   ? "Redirecting..."
-                  : accessToken.trim()
+                  : !useOAuth || accessToken.trim()
                     ? "Add Integration"
                     : "Connect with OAuth"}
             </Button>

@@ -9,18 +9,7 @@ import {
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Plug, Trash2 } from "lucide-react";
-
-export type McpIntegration = {
-  id: string;
-  name: string;
-  serverUrl: string;
-  oauth?: {
-    accessToken: string;
-    refreshToken?: string;
-    expiresIn?: number;
-    clientId?: string;
-  };
-};
+import type { CustomMcpIntegration as McpIntegration } from "~/utils/mcp/custom-mcp-config";
 
 interface CustomMcpCardProps {
   integration: McpIntegration;
@@ -41,7 +30,12 @@ export function CustomMcpCard({
     }
   }, [fetcher.data, onDelete]);
 
-  const isConnected = !!integration.oauth?.accessToken;
+  // TODO: No-auth custom MCP servers can be usable without OAuth tokens or
+  // headers, but this badge currently treats "has auth material" as "ready".
+  // Revisit the saved/ready UX before upstreaming this feature slice.
+  const isConnected =
+    !!integration.oauth?.accessToken ||
+    (integration.headers?.length ?? 0) > 0;
 
   return (
     <Card className="bg-background-3 transition-all">
@@ -54,7 +48,7 @@ export function CustomMcpCard({
           <div className="flex items-center gap-2">
             {isConnected && (
               <Badge className="h-6 rounded !bg-green-100 p-2 text-sm text-green-800">
-                Connected
+                Ready
               </Badge>
             )}
             <fetcher.Form method="post">
@@ -75,6 +69,12 @@ export function CustomMcpCard({
         <CardTitle className="text-base">{integration.name}</CardTitle>
         <CardDescription className="line-clamp-2 text-sm">
           {integration.serverUrl}
+        </CardDescription>
+        <CardDescription className="text-xs">
+          {(integration.transportStrategy || "http-first").replace("-", " · ")}
+          {(integration.headers?.length ?? 0) > 0
+            ? ` · ${integration.headers?.length} header${integration.headers?.length === 1 ? "" : "s"}`
+            : ""}
         </CardDescription>
       </CardHeader>
     </Card>
