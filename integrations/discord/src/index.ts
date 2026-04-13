@@ -39,7 +39,10 @@ export async function run(eventPayload: IntegrationEventPayload) {
         integrationDefinition.config.clientId,
         integrationDefinition.config.clientSecret,
         config?.redirect_uri,
-        config
+        {
+          ...config,
+          bot_token: integrationDefinition.config.botToken,
+        }
       );
 
       return result;
@@ -79,11 +82,10 @@ class DiscordCLI extends IntegrationCLI {
           authorization_url: 'https://discord.com/api/oauth2/authorize',
           scopes: [
             'identify',
+            'email',
             'guilds',
             'guilds.members.read',
             'bot',
-            'messages.read',
-            'gdm.join',
           ],
           scope_identifier: 'scope',
           scope_separator: ' ',
