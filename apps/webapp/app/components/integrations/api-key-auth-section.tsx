@@ -17,6 +17,7 @@ export function ApiKeyAuthSection({
   specData,
   activeAccount,
 }: ApiKeyAuthSectionProps) {
+  const apiKeyConfig = specData?.auth?.api_key;
   const [apiKey, setApiKey] = useState("");
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [isLoading, setIsLoading] = useState(false);
@@ -24,13 +25,14 @@ export function ApiKeyAuthSection({
   const apiKeyFetcher = useFetcher();
 
   const fields: Array<{ name: string; label: string; placeholder?: string; description?: string }> | undefined =
-    specData?.auth?.api_key?.fields;
+    apiKeyConfig?.fields;
 
   const isMultiField = Array.isArray(fields) && fields.length > 0;
+  const allowEmpty = !!apiKeyConfig?.allowEmpty && !isMultiField;
 
   const isSubmitDisabled = isMultiField
     ? fields.some((f) => !fieldValues[f.name]?.trim())
-    : !apiKey.trim();
+    : !allowEmpty && !apiKey.trim();
 
   const handleApiKeyConnect = useCallback(() => {
     if (isSubmitDisabled) return;
@@ -57,7 +59,7 @@ export function ApiKeyAuthSection({
     }
   }, [apiKeyFetcher.state, apiKeyFetcher.data, isLoading]);
 
-  if (activeAccount || !specData?.auth?.api_key) {
+  if (activeAccount || !apiKeyConfig) {
     return null;
   }
 
@@ -70,7 +72,7 @@ export function ApiKeyAuthSection({
           onClick={() => setShowApiKeyForm(true)}
           className="w-full"
         >
-          Connect with API Key
+          {apiKeyConfig?.connectLabel || "Connect with API Key"}
         </Button>
       ) : (
         <div className="flex flex-col gap-2">
@@ -98,10 +100,18 @@ export function ApiKeyAuthSection({
                 )}
               </div>
             ))
+          ) : allowEmpty ? (
+            <div className="flex flex-col gap-1">
+              {apiKeyConfig?.description && (
+                <p className="text-muted-foreground text-sm">
+                  {apiKeyConfig.description}
+                </p>
+              )}
+            </div>
           ) : (
             <div className="flex flex-col gap-1">
               <label htmlFor="apiKey" className="text-sm font-medium">
-                {specData?.auth?.api_key?.label || "API Key"}
+                {apiKeyConfig?.label || "API Key"}
               </label>
               <Input
                 id="apiKey"
@@ -109,9 +119,9 @@ export function ApiKeyAuthSection({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
               />
-              {specData?.auth?.api_key?.description && (
+              {apiKeyConfig?.description && (
                 <p className="text-muted-foreground text-sm">
-                  {specData.auth.api_key.description}
+                  {apiKeyConfig.description}
                 </p>
               )}
             </div>

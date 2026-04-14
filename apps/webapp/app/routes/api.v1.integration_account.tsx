@@ -79,8 +79,8 @@ const { action } = createHybridActionApiRoute(
       // For multi-field auth (e.g., Ghost), all values come from fields
       const hasFields = fields && Object.keys(fields).length > 0;
       const eventBody = hasFields
-        ? { apiKey: "", ...fields }
-        : { apiKey };
+        ? { apiKey: "", ...fields, userId }
+        : { apiKey, userId };
 
       // Trigger the SETUP event for the integration
       const messages = await IntegrationRunner.setup({
