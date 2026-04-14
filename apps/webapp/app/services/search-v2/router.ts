@@ -230,8 +230,10 @@ async function extractAspects(
         { role: "system", content: systemPrompt },
         { role: "user", content: `Query: "${intent}"` },
       ],
-      "high", // Use low-complexity model for cost efficiency
-      cacheKey
+      "low",
+      cacheKey,
+      undefined,
+      { callSite: "core.search-v2.router.aspect-extraction" },
     );
 
     logger.info(

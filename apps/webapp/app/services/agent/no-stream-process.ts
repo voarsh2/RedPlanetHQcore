@@ -4,9 +4,9 @@ import {
   upsertConversationHistory,
 } from "../conversation.server";
 import { EpisodeType, UserTypeEnum } from "@core/types";
-import { generateId, generateText, type LanguageModel, stepCountIs } from "ai";
+import { generateId, stepCountIs } from "ai";
 import { buildAgentContext } from "./agent-context";
-import { getModel } from "~/lib/model.server";
+import { makeTextModelCall } from "~/lib/model.server";
 import { addToQueue } from "~/lib/ingest.server";
 import { type MessagePlan } from "~/services/agent/types/decision-agent";
 
@@ -98,27 +98,34 @@ export async function noStreamProcess(
   const { systemPrompt, tools, modelMessages } = await buildAgentContext({
     userId,
     workspaceId,
+    conversationId: body.id,
     source: body.source as any,
     finalMessages,
+    preserveToolHistory: Boolean(isAssistantApproval),
     actionPlan: body.actionPlan,
     onMessage: body.onMessage,
     channelMetadata: body.channelMetadata,
   });
 
   // Generate response using generateText (non-streaming)
-  const result = await generateText({
-    model: getModel() as LanguageModel,
-    messages: [
+  const result = await makeTextModelCall(
+    [
       {
         role: "system",
         content: systemPrompt,
       },
       ...modelMessages,
     ],
-    tools,
-    stopWhen: [stepCountIs(10)],
-    temperature: 0.5,
-  });
+    {
+      tools,
+      stopWhen: [stepCountIs(10)],
+      temperature: 0.5,
+    },
+    "high",
+    "core-agent-chat",
+    undefined,
+    { callSite: "core.agent.chat.nostream" },
+  );
 
   // Create assistant message with UI-compatible parts
   // (must match the format expected by convertToModelMessages on reload)

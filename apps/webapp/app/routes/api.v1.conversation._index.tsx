@@ -1,7 +1,5 @@
 import {
-  streamText,
   validateUIMessages,
-  type LanguageModel,
   generateId,
   stepCountIs,
 } from "ai";
@@ -13,7 +11,7 @@ import {
   upsertConversationHistory,
 } from "~/services/conversation.server";
 
-import { getModel } from "~/lib/model.server";
+import { makeModelCall } from "~/lib/model.server";
 import { EpisodeType, UserTypeEnum } from "@core/types";
 import { enqueueCreateConversationTitle } from "~/lib/queue-adapter.server";
 import { addToQueue } from "~/lib/ingest.server";
@@ -136,23 +134,32 @@ const { loader, action } = createHybridActionApiRoute(
     const { systemPrompt, tools, modelMessages } = await buildAgentContext({
       userId: authentication.userId,
       workspaceId: authentication.workspaceId as string,
+      conversationId: body.id,
       source: body.source as any,
       finalMessages: useEmptyMessages ? [] : finalMessages,
+      preserveToolHistory: Boolean(isAssistantApproval),
     });
 
-    const result = streamText({
-      model: getModel() as LanguageModel,
-      messages: [
+    const result = await makeModelCall(
+      true,
+      [
         {
           role: "system",
           content: systemPrompt,
         },
         ...modelMessages,
       ],
-      tools,
-      stopWhen: [stepCountIs(10)],
-      temperature: 0.5,
-    });
+      () => {},
+      {
+        tools,
+        stopWhen: [stepCountIs(10)],
+        temperature: 0.5,
+      },
+      "high",
+      "core-agent-chat",
+      undefined,
+      { callSite: "core.agent.chat.stream" },
+    );
 
     result.consumeStream(); // no await
 

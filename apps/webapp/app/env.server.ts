@@ -121,6 +121,26 @@ const EnvironmentSchema = z
     EMBEDDING_MODEL_SIZE: z.string().default("1024"),
     MODEL_TEMPERATURE: z.coerce.number().default(1),
     LLM_TOLERANT_OUTPUT: z.string().optional(),
+    LLM_LOG_PROMPT_DIAGNOSTICS: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
+    LLM_LOG_OPENAI_WIRE: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
+    LLM_LOG_OPENAI_WIRE_BODIES: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
+    OPENAI_PROXY_FORCE_RESPONSES: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
     OLLAMA_URL: z.string().optional(),
     CHAT_PROVIDER: z.enum(["openai", "ollama"]).default("openai"),
     EMBEDDINGS_PROVIDER: z.enum(["openai", "ollama"]).optional(),

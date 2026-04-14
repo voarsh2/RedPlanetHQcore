@@ -16,13 +16,18 @@ import { type ChannelType } from "~/services/agent/prompts/channel-formats";
 import { createTools } from "~/services/agent/core-agent";
 import { type MessagePlan } from "~/services/agent/types/decision-agent";
 import { prisma } from "~/db.server";
+import { logger } from "../logger.service";
+import { getCompactedSessionBySessionId } from "../graphModels/compactedSession";
 
 interface BuildAgentContextParams {
   userId: string;
   workspaceId: string;
+  conversationId?: string;
   source: ChannelType;
   /** UI-format messages: { parts, role, id }[] */
   finalMessages: any[];
+  /** Preserve full tool history for approval continuation flows. */
+  preserveToolHistory?: boolean;
   /** Action plan from Decision Agent — injected into system prompt for reminder execution */
   actionPlan?: MessagePlan;
   /** Optional callback for channels to send intermediate messages (acks) */
@@ -39,17 +44,159 @@ interface AgentContext {
   timezone: string;
 }
 
+const RECENT_MESSAGE_WINDOW = 8;
+
+function hasApprovalStateDeep(parts: any[]): boolean {
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    if (
+      part.state === "approval-requested" ||
+      part.state === "approval-responded"
+    ) {
+      return true;
+    }
+
+    const nestedParts = Array.isArray(part.output?.parts)
+      ? part.output.parts
+      : Array.isArray(part.output?.content)
+        ? part.output.content
+        : [];
+
+    if (nestedParts.length > 0 && hasApprovalStateDeep(nestedParts)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getTopLevelTextParts(parts: any[]): Array<{ type: "text"; text: string }> {
+  return parts
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => ({ type: "text" as const, text: part.text.trim() }))
+    .filter((part) => part.text.length > 0);
+}
+
+function getToolSummary(parts: any[]): string | null {
+  const tools = parts
+    .filter((part) => typeof part?.type === "string" && part.type.includes("tool-"))
+    .map((part) => {
+      const toolName = String(part.type).replace("tool-", "");
+      const state =
+        typeof part.state === "string" && part.state.length > 0
+          ? ` (${part.state})`
+          : "";
+      return `${toolName}${state}`;
+    });
+
+  if (tools.length === 0) return null;
+
+  return `Prior tool activity omitted for brevity: ${tools.join(", ")}.`;
+}
+
+function sanitizeMessageForModelContext(message: any) {
+  const normalizedParts = Array.isArray(message?.parts)
+    ? message.parts.filter(Boolean)
+    : [];
+
+  if (normalizedParts.length === 0) {
+    return message;
+  }
+
+  const textParts = getTopLevelTextParts(normalizedParts);
+  if (textParts.length > 0) {
+    return {
+      ...message,
+      parts: textParts,
+    };
+  }
+
+  const toolSummary = getToolSummary(normalizedParts);
+  if (toolSummary) {
+    return {
+      ...message,
+      parts: [{ type: "text", text: toolSummary }],
+    };
+  }
+
+  return {
+    ...message,
+    parts: [],
+  };
+}
+
+function sanitizeMessagesForModelContext(
+  messages: any[],
+  preserveToolHistory: boolean,
+) {
+  if (preserveToolHistory) {
+    return messages;
+  }
+
+  let assistantMessagesSanitized = 0;
+  let assistantToolPartsDropped = 0;
+
+  const sanitized = messages
+    .map((message) => {
+      const normalizedParts = Array.isArray(message?.parts)
+        ? message.parts.filter(Boolean)
+        : [];
+
+      if (
+        message?.role === "assistant" &&
+        normalizedParts.length > 0 &&
+        !hasApprovalStateDeep(normalizedParts)
+      ) {
+        const toolParts = normalizedParts.filter(
+          (part) => typeof part?.type === "string" && part.type.includes("tool-"),
+        ).length;
+        const sanitizedMessage = sanitizeMessageForModelContext(message);
+        if (sanitizedMessage.parts !== message.parts) {
+          assistantMessagesSanitized += 1;
+          assistantToolPartsDropped += toolParts;
+        }
+        return sanitizedMessage;
+      }
+
+      if (message?.role === "user" && normalizedParts.length > 0) {
+        return sanitizeMessageForModelContext(message);
+      }
+
+      return message;
+    })
+    .filter((message) => Array.isArray(message?.parts) && message.parts.length > 0);
+
+  if (assistantMessagesSanitized > 0) {
+    const rawChars = JSON.stringify(messages).length;
+    const sanitizedChars = JSON.stringify(sanitized).length;
+    logger.info("Agent context sanitized conversation history", {
+      assistantMessagesSanitized,
+      assistantToolPartsDropped,
+      originalMessages: messages.length,
+      sanitizedMessages: sanitized.length,
+      rawChars,
+      sanitizedChars,
+      reducedChars: rawChars - sanitizedChars,
+    });
+  }
+
+  return sanitized;
+}
+
 export async function buildAgentContext({
   userId,
   workspaceId,
+  conversationId,
   source,
   finalMessages,
+  preserveToolHistory = false,
   actionPlan,
   onMessage,
   channelMetadata,
 }: BuildAgentContextParams): Promise<AgentContext> {
   // Load context in parallel
-  const [user, persona, connectedIntegrations, skills] = await Promise.all([
+  const [user, persona, connectedIntegrations, skills, compactedSession] =
+    await Promise.all([
     getUserById(userId),
     getPersonaDocumentForUser(workspaceId),
     IntegrationLoader.getConnectedIntegrationAccounts(userId, workspaceId),
@@ -58,7 +205,18 @@ export async function buildAgentContext({
       select: { id: true, title: true, metadata: true },
       orderBy: { createdAt: "desc" },
     }),
-  ]);
+    conversationId && !preserveToolHistory
+      ? getCompactedSessionBySessionId(conversationId, userId, workspaceId).catch(
+          (error) => {
+            logger.warn("Failed to load compacted session for agent context", {
+              conversationId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return null;
+          },
+        )
+      : Promise.resolve(null),
+    ]);
 
   const metadata = user?.metadata as Record<string, unknown> | null;
   const timezone = (metadata?.timezone as string) ?? "UTC";
@@ -172,9 +330,34 @@ Guidelines:
 </action_plan>`;
   }
 
+  let contextMessages = sanitizeMessagesForModelContext(
+    finalMessages,
+    preserveToolHistory,
+  );
+
+  if (
+    !preserveToolHistory &&
+    compactedSession?.summary &&
+    contextMessages.length > RECENT_MESSAGE_WINDOW
+  ) {
+    const recentMessages = contextMessages.slice(-RECENT_MESSAGE_WINDOW);
+
+    systemPrompt += `\n\n<session_summary>\nThis is a compacted summary of earlier conversation context for this session. Prefer it over replaying older verbatim history.\n\n${compactedSession.summary}\n</session_summary>`;
+
+    logger.info("Agent context applied compacted session summary", {
+      conversationId,
+      compactSummaryChars: compactedSession.summary.length,
+      originalMessages: contextMessages.length,
+      recentMessagesRetained: recentMessages.length,
+      droppedMessages: contextMessages.length - recentMessages.length,
+    });
+
+    contextMessages = recentMessages;
+  }
+
   // Convert to model messages
   const modelMessages: ModelMessage[] = await convertToModelMessages(
-    finalMessages,
+    contextMessages,
     {
       tools,
       ignoreIncompleteToolCalls: true,

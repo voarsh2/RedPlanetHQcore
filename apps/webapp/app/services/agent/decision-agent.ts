@@ -12,8 +12,8 @@
  * - Has gather_context tool to query orchestrator (read-only)
  */
 
-import { generateText, stepCountIs } from "ai";
-import { getModel, getModelForTask } from "~/lib/model.server";
+import { stepCountIs } from "ai";
+import { makeTextModelCall } from "~/lib/model.server";
 
 import {
   type Trigger,
@@ -198,10 +198,6 @@ export async function runDecisionAgent(
       channel: trigger.channel,
     });
 
-    // Use low complexity model (auto-downgrades to Haiku)
-    const model = getModelForTask("low");
-    const modelInstance = getModel(model);
-
     // Build tools if MCP client is provided
     const tools = await createTools(
       context.user.userId as string,
@@ -212,12 +208,17 @@ export async function runDecisionAgent(
       userPersona,
     );
 
-    const { text } = await generateText({
-      model: modelInstance as any,
-      messages: [{ role: "user", content: prompt }],
-      tools,
-      stopWhen: stepCountIs(5), // Allow multiple steps if tools available
-    });
+    const { text } = await makeTextModelCall(
+      [{ role: "user", content: prompt }],
+      {
+        tools,
+        stopWhen: stepCountIs(5),
+      },
+      "low",
+      `core-decision-agent-${trigger.type}`,
+      undefined,
+      { callSite: "core.decision-agent.plan" },
+    );
 
     // Parse the action plan from response
     const parsedPlan = parseActionPlan(text);

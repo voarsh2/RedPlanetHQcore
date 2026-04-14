@@ -12,7 +12,7 @@ import { runIntegrationExplorer, runWebExplorer } from "./explorers";
 import { searchMemoryWithAgent } from "./memory";
 import { logger } from "../logger.service";
 import { IntegrationLoader } from "~/utils/mcp/integration-loader";
-import { getModel, getModelForTask } from "~/lib/model.server";
+import { makeModelCall } from "~/lib/model.server";
 import { getGatewayAgents, runGatewayExplorer } from "./gateway";
 import { type SkillRef } from "./types";
 import { prisma } from "~/db.server";
@@ -43,7 +43,7 @@ const hasApprovalRequested = (message: UIMessage): boolean => {
 
 export type OrchestratorMode = "read" | "write";
 
-const getOrchestratorPrompt = (
+export const buildOrchestratorPrompt = (
   integrations: string,
   mode: OrchestratorMode,
   gateways: string,
@@ -70,14 +70,7 @@ When you receive a skill reference (skill name + ID) in the user message, call g
 
   if (mode === "write") {
     return `You are an orchestrator. Execute actions on integrations or gateways.
-${personaSection}
-CONNECTED INTEGRATIONS:
-${integrations}
 
-<gateways>
-${gateways || "No gateways connected"}
-</gateways>
-${skillsSection}
 TOOLS:
 - memory_search: Search for prior context not covered by the user persona above. CORE handles query understanding internally.
 - integration_action: Execute an action on a connected service (create, update, delete)
@@ -119,18 +112,21 @@ This summary will be returned to the parent agent, so include:
 - The result (success/failure)
 - Any relevant details (IDs, URLs, error messages)
 
-Example final summary: "Created GitHub issue #123 'Fix auth bug' in core repo. URL: https://github.com/org/core/issues/123"`;
-  }
+Example final summary: "Created GitHub issue #123 'Fix auth bug' in core repo. URL: https://github.com/org/core/issues/123"
 
-  return `You are an orchestrator. Gather information based on the intent.
-${personaSection}
-CONNECTED INTEGRATIONS:
+<runtime_context>
+${personaSection ? `${personaSection.trim()}\n` : ""}CONNECTED INTEGRATIONS:
 ${integrations}
 
 <gateways>
 ${gateways || "No gateways connected"}
 </gateways>
-${skillsSection}
+${skillsSection ? skillsSection.trim() : ""}
+</runtime_context>`;
+  }
+
+  return `You are an orchestrator. Gather information based on the intent.
+
 TOOLS:
 - memory_search: Search for prior context not covered by the user persona above. CORE handles query understanding internally.
 - integration_query: Live data from connected services (emails, calendar, issues, messages)
@@ -206,7 +202,17 @@ RULES:
 - NEVER ask the user for info that's already in persona or memory.
 - After getting context, proceed with other tools as needed.
 - Call multiple tools in parallel when data could be in multiple places.
-- No personality. Return raw facts.`;
+- No personality. Return raw facts.
+
+<runtime_context>
+${personaSection ? `${personaSection.trim()}\n` : ""}CONNECTED INTEGRATIONS:
+${integrations}
+
+<gateways>
+${gateways || "No gateways connected"}
+</gateways>
+${skillsSection ? skillsSection.trim() : ""}
+</runtime_context>`;
 };
 
 export interface OrchestratorResult {
@@ -501,23 +507,32 @@ export async function runOrchestrator(
     });
   }
 
-  const model = getModelForTask("high");
-  const modelInstance = getModel(model);
-
-  const stream = streamText({
-    model: modelInstance as LanguageModel,
-    system: getOrchestratorPrompt(
-      integrationsList,
-      mode,
-      gatewaysList,
-      userPersona,
-      skills,
-    ),
-    messages: [{ role: "user", content: userMessage }],
-    tools,
-    stopWhen: stepCountIs(10),
-    abortSignal,
-  });
+  const stream = await makeModelCall(
+    true,
+    [
+      {
+        role: "system",
+        content: buildOrchestratorPrompt(
+          integrationsList,
+          mode,
+          gatewaysList,
+          userPersona,
+          skills,
+        ),
+      },
+      { role: "user", content: userMessage },
+    ],
+    () => {},
+    {
+      tools,
+      stopWhen: stepCountIs(10),
+      abortSignal,
+    },
+    "high",
+    `core-orchestrator-${mode}`,
+    undefined,
+    { callSite: `core.orchestrator.${mode}` },
+  );
 
   logger.info(`Orchestrator: Starting stream for mode ${mode}`);
 

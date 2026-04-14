@@ -1,19 +1,20 @@
-import { streamText, type LanguageModel, stepCountIs, tool } from "ai";
+import { stepCountIs, tool } from "ai";
 import { z } from "zod";
 
 import Exa from "exa-js";
 import { logger } from "~/services/logger.service";
 import { env } from "~/env.server";
-import { getModel, getModelForTask } from "~/lib/model.server";
+import { makeTextModelCall } from "~/lib/model.server";
 
 const WEB_COMPLEXITY = "high";
 
-const getWebExplorerPrompt = (timezone: string = "UTC") => {
-  const today = new Date().toLocaleDateString("en-CA", { timeZone: timezone });
+export const buildWebExplorerPrompt = (
+  timezone: string = "UTC",
+  now: Date = new Date(),
+) => {
+  const today = now.toLocaleDateString("en-CA", { timeZone: timezone });
 
   return `You are a Web Explorer. Search the web OR read specific URLs.
-
-TODAY: ${today} (${timezone})
 
 TOOLS:
 - web_search: Search the web for information. Returns titles, URLs, and snippets.
@@ -40,7 +41,11 @@ RULES:
 - Facts only. No personality.
 - Cite sources when relevant (include URLs).
 - If search returns nothing useful, say so.
-- For URLs: extract and summarize the main content.`;
+- For URLs: extract and summarize the main content.
+
+<runtime_context>
+TODAY: ${today} (${timezone})
+</runtime_context>`;
 };
 
 export async function runWebExplorer(
@@ -150,18 +155,20 @@ ${r.text || "No content available"}`;
   };
 
   try {
-    let model = getModelForTask(WEB_COMPLEXITY);
-    logger.info(`complexity: ${WEB_COMPLEXITY}, model: ${model}`);
-
-    const modelInstance = getModel(model);
-
-    const { text } = await generateText({
-      model: modelInstance as LanguageModel,
-      system: getWebExplorerPrompt(timezone),
-      messages: [{ role: "user", content: query }],
-      tools,
-      stopWhen: stepCountIs(6),
-    });
+    const { text } = await makeTextModelCall(
+      [
+        { role: "system", content: buildWebExplorerPrompt(timezone) },
+        { role: "user", content: query },
+      ],
+      {
+        tools,
+        stopWhen: stepCountIs(6),
+      },
+      WEB_COMPLEXITY,
+      "core-web-explorer",
+      undefined,
+      { callSite: "core.web-explorer.read" },
+    );
 
     logger.info("WebExplorer completed", {
       executionTimeMs: Date.now() - startTime,

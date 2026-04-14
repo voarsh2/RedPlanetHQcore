@@ -8,6 +8,7 @@ import { AnthropicBatchProvider } from "./batch/providers/anthropic";
 import { logger } from "~/services/logger.service";
 import { generateObject, generateText, type LanguageModel } from "ai";
 import {
+  getEffectiveOpenAIApiMode,
   getModel,
   getModelForBatch,
   makeStructuredModelCall,
@@ -132,7 +133,7 @@ async function runInlineBatch<T = any>(
   const startedAt = new Date();
 
   const concurrency = env.INLINE_BATCH_CONCURRENCY;
-  const openaiApiMode = env.OPENAI_API_MODE;
+  const openaiApiMode = getEffectiveOpenAIApiMode(modelId);
   const hasOpenAIBaseUrl =
     typeof env.OPENAI_BASE_URL === "string" &&
     env.OPENAI_BASE_URL.trim().length > 0;
@@ -248,21 +249,29 @@ export async function createBatch<T = any>(params: CreateBatchParams<T>) {
     const modelId = env.MODEL;
 
     const provider = getProvider(modelId);
-    const openaiApiMode = env.OPENAI_API_MODE;
+    const openaiApiMode = getEffectiveOpenAIApiMode(modelId);
     const hasOpenAIBaseUrl =
       typeof env.OPENAI_BASE_URL === "string" &&
       env.OPENAI_BASE_URL.trim().length > 0;
     const forceInlineForProxy =
       provider.providerName === "openai" &&
-      hasOpenAIBaseUrl &&
-      openaiApiMode === "chat_completions";
+      hasOpenAIBaseUrl;
 
     logger.info(
       `Creating batch with ${provider.providerName} provider for model ${modelId}`,
+      {
+        configuredOpenAIMode: env.OPENAI_API_MODE,
+        effectiveOpenAIMode: openaiApiMode,
+        hasOpenAIBaseUrl,
+        strategy: forceInlineForProxy
+          ? "inline_proxy_fallback"
+          : "provider_batch_api",
+      },
     );
 
-    // OpenAI-compatible proxies in chat-completions mode typically don't expose `/batches`.
-    // Route directly to inline execution instead of attempting the Batch API first.
+    // OpenAI-compatible proxies may support chat/responses generation while still not exposing
+    // the native `/files` + `/batches` API surface. Keep proxy-backed OpenAI traffic on the
+    // existing inline fallback regardless of the effective wire mode used for normal LLM calls.
     if (forceInlineForProxy) {
       return await runInlineBatch(params);
     }

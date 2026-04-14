@@ -1,6 +1,5 @@
 import {
   streamText,
-  type LanguageModel,
   stepCountIs,
   tool,
   readUIMessageStream,
@@ -8,7 +7,7 @@ import {
 import { z } from "zod";
 
 import { logger } from "~/services/logger.service";
-import { getModel, getModelForTask } from "~/lib/model.server";
+import { makeModelCall } from "~/lib/model.server";
 import { getConnectedGateways, getGateway } from "~/services/gateway.server";
 import { callGatewayTool } from "../../../websocket";
 
@@ -125,7 +124,7 @@ function createDirectGatewayTools(
 
 // === Gateway Explorer Prompt ===
 
-const getGatewayExplorerPrompt = (
+export const buildGatewayExplorerPrompt = (
   gatewayName: string,
   gatewayDescription: string | null,
   tools: GatewayTool[],
@@ -135,9 +134,6 @@ const getGatewayExplorerPrompt = (
     .join("\n");
 
   return `You are an execution agent for the "${gatewayName}" gateway.
-${gatewayDescription ? `\nPurpose: ${gatewayDescription}\n` : ""}
-AVAILABLE TOOLS:
-${toolsList}
 
 EXECUTION:
 1. Analyze the intent
@@ -154,7 +150,12 @@ RESPONSE:
 After execution, provide a clear summary of:
 - What was done
 - Results or outputs
-- Any errors encountered`;
+- Any errors encountered
+
+<runtime_context>
+${gatewayDescription ? `Purpose: ${gatewayDescription}\n` : ""}AVAILABLE TOOLS:
+${toolsList}
+</runtime_context>`;
 };
 
 // === Gateway Sub-Agent Executor ===
@@ -193,25 +194,34 @@ export async function runGatewayExplorer(
   // Each gateway tool becomes a real Zod-typed tool the sub-agent can call directly
   const tools = createDirectGatewayTools(gatewayId, gatewayTools);
 
-  const model = getModelForTask("high");
-  const modelInstance = getModel(model);
-
   logger.info(
     `GatewayExplorer: Starting stream for gateway "${gateway.name}" with ${gatewayTools.length} tools`,
   );
 
-  const stream = streamText({
-    model: modelInstance as LanguageModel,
-    system: getGatewayExplorerPrompt(
-      gateway.name,
-      gateway.description,
-      gatewayTools,
-    ),
-    messages: [{ role: "user", content: intent }],
-    tools,
-    stopWhen: stepCountIs(15), // Allow more steps for complex gateway operations
-    abortSignal,
-  });
+  const stream = await makeModelCall(
+    true,
+    [
+      {
+        role: "system",
+        content: buildGatewayExplorerPrompt(
+          gateway.name,
+          gateway.description,
+          gatewayTools,
+        ),
+      },
+      { role: "user", content: intent },
+    ],
+    () => {},
+    {
+      tools,
+      stopWhen: stepCountIs(15),
+      abortSignal,
+    },
+    "high",
+    "core-gateway-explorer",
+    undefined,
+    { callSite: "core.gateway-explorer.read" },
+  );
 
   return {
     stream: stream as any,

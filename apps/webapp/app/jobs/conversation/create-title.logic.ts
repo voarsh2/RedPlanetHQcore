@@ -2,7 +2,7 @@ import { conversationTitlePrompt } from "~/trigger/conversation/prompt";
 import { prisma } from "~/trigger/utils/prisma";
 import { logger } from "~/services/logger.service";
 import { generateText, type LanguageModel } from "ai";
-import { getModel } from "~/lib/model.server";
+import { getEffectiveOpenAIApiMode, getModel } from "~/lib/model.server";
 import { env } from "~/env.server";
 
 export interface CreateConversationTitlePayload {
@@ -38,7 +38,7 @@ export async function processConversationTitleCreation(
     const tolerantOutput =
       tolerantOverride
         ? tolerantOverride === "true" || tolerantOverride === "1" || tolerantOverride === "yes"
-        : ((env.OPENAI_API_MODE === "chat_completions" && !!env.OPENAI_BASE_URL) ||
+        : ((getEffectiveOpenAIApiMode() === "chat_completions" && !!env.OPENAI_BASE_URL) ||
             env.CHAT_PROVIDER === "ollama");
     const { text } = await generateText({
       model: getModel() as LanguageModel,

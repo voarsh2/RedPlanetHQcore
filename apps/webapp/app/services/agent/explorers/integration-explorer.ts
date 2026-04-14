@@ -1,8 +1,8 @@
-import { streamText, type LanguageModel, stepCountIs, tool } from "ai";
+import { streamText, stepCountIs, tool } from "ai";
 import { z } from "zod";
 
 import { logger } from "~/services/logger.service";
-import { getModel, getModelForTask } from "~/lib/model.server";
+import { makeModelCall } from "~/lib/model.server";
 import {
   handleExecuteIntegrationAction,
   handleGetIntegrationActions,
@@ -39,18 +39,17 @@ function getDateTimeInTimezone(date: Date, timezone: string): string {
   return `${dateStr} ${timeStr}`;
 }
 
-const getIntegrationExplorerPrompt = (
+export const buildIntegrationExplorerPrompt = (
   integrations: string,
   mode: IntegrationMode = "read",
   timezone: string = "UTC",
+  now: Date = new Date(),
 ) => {
   const modeInstructions =
     mode === "write"
       ? `You can CREATE, UPDATE, or DELETE. Execute the requested action.`
       : `READ ONLY. Never create, update, or delete.`;
 
-  // Get current date and time in user's timezone
-  const now = new Date();
   const today = getDateInTimezone(now, timezone);
   const currentDateTime = getDateTimeInTimezone(now, timezone);
 
@@ -60,15 +59,6 @@ const getIntegrationExplorerPrompt = (
   const yesterdayDate = getDateInTimezone(yesterday, timezone);
 
   return `You are an Integration Explorer. ${mode === "write" ? "Execute actions on" : "Query"} ONE specific integration.
-
-NOW: ${currentDateTime} (${timezone})
-TODAY: ${today}
-YESTERDAY: ${yesterdayDate}
-
-⚠️ DATE/TIME QUERIES: Be cautious with datetime filters - each integration has different date formats and query syntax. Check the inputSchema carefully. Relative terms like "newer_than:1d" can be unreliable. Prefer explicit date ranges when available.
-
-CONNECTED INTEGRATIONS:
-${integrations || "No integrations connected."}
 
 TOOLS:
 - get_integration_actions: Find available actions for a service (returns inputSchema)
@@ -120,7 +110,18 @@ RULES:
 
 CRITICAL - FINAL SUMMARY:
 When you have completed the integration query/action, write a clear, concise summary as your final response.
-This summary will be returned to the orchestrator, so include all relevant details from the results.`;
+This summary will be returned to the orchestrator, so include all relevant details from the results.
+
+<runtime_context>
+NOW: ${currentDateTime} (${timezone})
+TODAY: ${today}
+YESTERDAY: ${yesterdayDate}
+
+⚠️ DATE/TIME QUERIES: Be cautious with datetime filters - each integration has different date formats and query syntax. Check the inputSchema carefully. Relative terms like "newer_than:1d" can be unreliable. Prefer explicit date ranges when available.
+
+CONNECTED INTEGRATIONS:
+${integrations || "No integrations connected."}
+</runtime_context>`;
 };
 
 export interface IntegrationExplorerResult {
@@ -145,11 +146,16 @@ export async function runIntegrationExplorer(
 
   if (!availableIntegrations.length) {
     // Return empty stream for no integrations
-    const stream = streamText({
-      model: getModel() as LanguageModel,
-      messages: [{ role: "user", content: "no integrations connected" }],
-      abortSignal,
-    });
+    const stream = await makeModelCall(
+      true,
+      [{ role: "user", content: "no integrations connected" }],
+      () => {},
+      { abortSignal },
+      "high",
+      "core-integration-explorer-empty",
+      undefined,
+      { callSite: "core.integration-explorer.empty" },
+    );
 
     return {
       stream,
@@ -224,21 +230,34 @@ export async function runIntegrationExplorer(
     }),
   };
 
-  const model = getModelForTask(INTEGRATION_COMPLEXITY);
   logger.info(
-    `IntegrationExplorer: Starting stream, complexity: ${INTEGRATION_COMPLEXITY}, model: ${model}`,
+    `IntegrationExplorer: Starting stream, complexity: ${INTEGRATION_COMPLEXITY}`,
   );
 
-  const modelInstance = getModel(model);
-
-  const stream = streamText({
-    model: modelInstance as LanguageModel,
-    system: getIntegrationExplorerPrompt(availableIntegrations, mode, timezone),
-    messages: [{ role: "user", content: query }],
-    tools,
-    stopWhen: stepCountIs(10),
-    abortSignal,
-  });
+  const stream = await makeModelCall(
+    true,
+    [
+      {
+        role: "system",
+        content: buildIntegrationExplorerPrompt(
+          availableIntegrations,
+          mode,
+          timezone,
+        ),
+      },
+      { role: "user", content: query },
+    ],
+    () => {},
+    {
+      tools,
+      stopWhen: stepCountIs(10),
+      abortSignal,
+    },
+    INTEGRATION_COMPLEXITY,
+    `core-integration-explorer-${mode}`,
+    undefined,
+    { callSite: `core.integration-explorer.${mode}` },
+  );
 
   return {
     stream,

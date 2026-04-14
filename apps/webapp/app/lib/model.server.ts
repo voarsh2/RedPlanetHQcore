@@ -5,11 +5,13 @@ import {
   streamText,
   type ModelMessage,
 } from "ai";
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { type z } from "zod";
 import {
   createOpenAI,
   openai,
-  type OpenAIResponsesProviderOptions,
 } from "@ai-sdk/openai";
 import { logger } from "~/services/logger.service";
 
@@ -19,6 +21,7 @@ import { google } from "@ai-sdk/google";
 import { env } from "~/env.server";
 
 export type ModelComplexity = "high" | "low";
+export type OpenAIApiMode = "responses" | "chat_completions";
 
 function shouldUseOllamaForEmbeddings(
   embeddingsProvider?: "openai" | "ollama",
@@ -89,8 +92,8 @@ export const getModel = (takeModel?: string) => {
   const openaiBaseUrl = env.OPENAI_BASE_URL;
   const ollamaUrl = env.OLLAMA_URL;
   const chatProvider = env.CHAT_PROVIDER;
-  const openaiApiMode = env.OPENAI_API_MODE === "chat" ? "chat_completions" : env.OPENAI_API_MODE;
   model = model || env.MODEL;
+  const openaiApiMode = getEffectiveOpenAIApiMode(model);
 
   let modelInstance;
   let modelTemperature = env.MODEL_TEMPERATURE;
@@ -145,10 +148,12 @@ export const getModel = (takeModel?: string) => {
       ? createOpenAI({
           baseURL: openaiBaseUrl,
           apiKey: openaiKey,
+          fetch: buildOpenAIWireFetch(globalThis.fetch),
         })
       : openai;
-    // `responses`: preferred when calling native OpenAI (supports prompt caching, stored items, etc.).
-    // `chat_completions`: preferred for many OpenAI-compatible proxies (more widely supported, stateless).
+    // `responses`: preferred when calling native OpenAI and now also available for proxy experiments
+    // when OPENAI_PROXY_FORCE_RESPONSES is enabled.
+    // `chat_completions`: compatibility fallback for many OpenAI-compatible proxies.
     modelInstance = openaiApiMode === "chat_completions"
       ? openaiClient.chat(model)
       : openaiClient.responses(model);
@@ -157,11 +162,311 @@ export const getModel = (takeModel?: string) => {
   return modelInstance;
 };
 
+export function getConfiguredOpenAIApiMode(): OpenAIApiMode {
+  return env.OPENAI_API_MODE === "chat" ? "chat_completions" : env.OPENAI_API_MODE;
+}
+
+export function shouldForceProxyResponsesForModel(model?: string): boolean {
+  if (!env.OPENAI_BASE_URL || env.CHAT_PROVIDER === "ollama") return false;
+  if (!env.OPENAI_PROXY_FORCE_RESPONSES) return false;
+
+  const configuredMode = getConfiguredOpenAIApiMode();
+  if (configuredMode !== "chat_completions") return false;
+
+  if (!model) return true;
+  return model.includes("gpt");
+}
+
+export function getEffectiveOpenAIApiMode(model?: string): OpenAIApiMode {
+  return shouldForceProxyResponsesForModel(model)
+    ? "responses"
+    : getConfiguredOpenAIApiMode();
+}
+
+function extractUrlString(input: unknown): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  if (
+    input &&
+    typeof input === "object" &&
+    "url" in input &&
+    typeof (input as { url?: unknown }).url === "string"
+  ) {
+    return (input as { url: string }).url;
+  }
+  return "";
+}
+
+function logOpenAIWireEvent(event: Record<string, unknown>) {
+  if (!env.LLM_LOG_OPENAI_WIRE) return;
+
+  const logDir = "/tmp/core-openai-wire";
+  mkdirSync(logDir, { recursive: true });
+  appendFileSync(
+    path.join(logDir, "responses-wire.jsonl"),
+    `${JSON.stringify(event)}\n`,
+    "utf8",
+  );
+}
+
+function writeOpenAIWireBody(
+  eventId: string,
+  phase: "request" | "response",
+  body: string,
+) {
+  if (!env.LLM_LOG_OPENAI_WIRE_BODIES) return;
+
+  const logDir = "/tmp/core-openai-wire/bodies";
+  mkdirSync(logDir, { recursive: true });
+  appendFileSync(path.join(logDir, `${eventId}.${phase}.json`), body, "utf8");
+}
+
+function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
+  return async (input, init) => {
+    const url = extractUrlString(input);
+    const inputMethod =
+      input &&
+      typeof input === "object" &&
+      "method" in input &&
+      typeof (input as { method?: unknown }).method === "string"
+        ? (input as { method: string }).method
+        : undefined;
+    const method = (init?.method || inputMethod || "GET").toUpperCase();
+    const shouldLogRequest =
+      env.LLM_LOG_OPENAI_WIRE &&
+      method === "POST" &&
+      url.includes("/responses");
+
+    if (!shouldLogRequest) {
+      return baseFetch(input, init);
+    }
+
+    let parsedBody: Record<string, unknown> | undefined;
+    const rawBody =
+      typeof init?.body === "string"
+        ? init.body
+        : typeof (input as { body?: unknown } | undefined)?.body === "string"
+          ? ((input as { body?: string }).body as string)
+          : undefined;
+
+    if (rawBody) {
+      try {
+        parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
+      } catch {
+        parsedBody = undefined;
+      }
+    }
+
+    const inputItems = Array.isArray(parsedBody?.input)
+      ? (parsedBody.input as unknown[])
+      : [];
+    const serializedBody = rawBody || JSON.stringify(parsedBody || {});
+    const eventId = crypto.randomUUID();
+
+    logOpenAIWireEvent({
+      event: "request",
+      eventId,
+      timestamp: new Date().toISOString(),
+      url,
+      method,
+      bodyHash: createHash("sha256").update(serializedBody).digest("hex"),
+      bodyChars: serializedBody.length,
+      hasPromptCacheKey: typeof parsedBody?.prompt_cache_key === "string",
+      promptCacheKey: parsedBody?.prompt_cache_key,
+      promptCacheRetention: parsedBody?.prompt_cache_retention,
+      store: parsedBody?.store,
+      stream: parsedBody?.stream,
+      model: parsedBody?.model,
+      hasInstructions: typeof parsedBody?.instructions === "string",
+      instructionsChars:
+        typeof parsedBody?.instructions === "string"
+          ? parsedBody.instructions.length
+          : 0,
+      toolsCount: Array.isArray(parsedBody?.tools) ? parsedBody.tools.length : 0,
+      toolChoice: parsedBody?.tool_choice,
+      parallelToolCalls: parsedBody?.parallel_tool_calls,
+      serviceTier: parsedBody?.service_tier,
+      reasoning: parsedBody?.reasoning,
+      text: parsedBody?.text,
+      include: parsedBody?.include,
+      inputCount: inputItems.length,
+      inputPreview: inputItems.slice(0, 3),
+    });
+    writeOpenAIWireBody(eventId, "request", serializedBody);
+
+    const response = await baseFetch(input, init);
+    let responseBody = "";
+    if (env.LLM_LOG_OPENAI_WIRE_BODIES) {
+      try {
+        responseBody = await response.clone().text();
+      } catch {
+        responseBody = "";
+      }
+    }
+    logOpenAIWireEvent({
+      event: "response",
+      eventId,
+      timestamp: new Date().toISOString(),
+      url,
+      method,
+      status: response.status,
+      ok: response.ok,
+    });
+    if (responseBody) {
+      writeOpenAIWireBody(eventId, "response", responseBody);
+    }
+    return response;
+  };
+}
+
 export interface TokenUsage {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
   cachedInputTokens?: number;
+}
+
+export interface ModelCallTelemetry {
+  callSite?: string;
+}
+
+interface PromptDiagnostics {
+  promptChars: number;
+  promptHash: string;
+  promptPrefixHash: string;
+  messageCount: number;
+}
+
+function buildOpenAIPromptCacheOptions({
+  model,
+  cacheKey,
+  reasoningEffort,
+  configuredOpenaiApiMode,
+  effectiveOpenaiApiMode,
+  useOllamaForChat,
+}: {
+  model: string;
+  cacheKey?: string;
+  reasoningEffort?: "low" | "medium" | "high";
+  configuredOpenaiApiMode: OpenAIApiMode;
+  effectiveOpenaiApiMode: OpenAIApiMode;
+  useOllamaForChat: boolean;
+}): {
+  providerOptions?: { openai: Record<string, unknown> };
+  promptCacheConfigured: boolean;
+  promptCacheStrategy: string;
+} {
+  if (!model.includes("gpt") || useOllamaForChat) {
+    return {
+      promptCacheConfigured: false,
+      promptCacheStrategy: "disabled",
+    };
+  }
+
+  const isResponsesMode = effectiveOpenaiApiMode === "responses";
+  const isForcedProxyResponses =
+    configuredOpenaiApiMode === "chat_completions" &&
+    effectiveOpenaiApiMode === "responses" &&
+    !!env.OPENAI_BASE_URL;
+  const isProxyResponsesMode = isResponsesMode && !!env.OPENAI_BASE_URL;
+
+  if (!isResponsesMode) {
+    return {
+      promptCacheConfigured: false,
+      promptCacheStrategy: "unsupported-mode",
+    };
+  }
+
+  const openaiOptions: Record<string, unknown> = {
+    promptCacheKey: cacheKey || `model-call`,
+  };
+
+  if (model.startsWith("gpt-5")) {
+    if (model.includes("mini")) {
+      if (isResponsesMode) {
+        openaiOptions.reasoningEffort = "low";
+      }
+    } else {
+      openaiOptions.promptCacheRetention = "24h";
+      if (isResponsesMode) {
+        openaiOptions.reasoningEffort = reasoningEffort || "none";
+      }
+    }
+  }
+
+  return {
+    providerOptions: {
+      openai: openaiOptions,
+    },
+    promptCacheConfigured: true,
+    promptCacheStrategy:
+      isProxyResponsesMode
+        ? isForcedProxyResponses
+          ? "responses-proxy-forced"
+          : "responses-proxy"
+        : "responses-native",
+  };
+}
+
+function serializeMessageContent(content: ModelMessage["content"]): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (!part || typeof part !== "object") return JSON.stringify(part);
+
+        const record = part as Record<string, unknown>;
+        if (typeof record.text === "string") {
+          return record.text;
+        }
+
+        return JSON.stringify(record);
+      })
+      .join("\n");
+  }
+
+  return JSON.stringify(content);
+}
+
+function buildPromptDiagnostics(messages: ModelMessage[]): PromptDiagnostics {
+  const serializedPrompt = messages
+    .map((message) => {
+      const role = "role" in message ? message.role : "unknown";
+      const content = "content" in message
+        ? serializeMessageContent(message.content)
+        : JSON.stringify(message);
+      return `${role}:\n${content}`;
+    })
+    .join("\n\n");
+
+  return {
+    promptChars: serializedPrompt.length,
+    promptHash: createHash("sha256").update(serializedPrompt).digest("hex"),
+    promptPrefixHash: createHash("sha256")
+      .update(serializedPrompt.slice(0, 8192))
+      .digest("hex"),
+    messageCount: messages.length,
+  };
+}
+
+function logPromptDiagnostics(
+  phase: "request" | "response",
+  model: string,
+  complexity: ModelComplexity,
+  diagnostics: PromptDiagnostics,
+  telemetry?: ModelCallTelemetry,
+  extra?: Record<string, unknown>,
+) {
+  if (!env.LLM_LOG_PROMPT_DIAGNOSTICS) return;
+
+  logger.info(`[LLM/${phase}] ${telemetry?.callSite || "unspecified"}`, {
+    model,
+    complexity,
+    callSite: telemetry?.callSite,
+    ...diagnostics,
+    ...extra,
+  });
 }
 
 export async function makeModelCall(
@@ -172,48 +477,47 @@ export async function makeModelCall(
   complexity: ModelComplexity = "high",
   cacheKey?: string,
   reasoningEffort?: "low" | "medium" | "high",
+  telemetry?: ModelCallTelemetry,
 ) {
   let model = getModelForTask(complexity);
   logger.info(`complexity: ${complexity}, model: ${model}`);
 
   const modelInstance = getModel(model);
   const generateTextOptions: any = {};
+  const promptDiagnostics = buildPromptDiagnostics(messages);
 
-  const openaiApiMode = env.OPENAI_API_MODE === "chat" ? "chat_completions" : env.OPENAI_API_MODE;
+  const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
+  const openaiApiMode = getEffectiveOpenAIApiMode(model);
   const useOllamaForChat = env.CHAT_PROVIDER === "ollama";
-
-  // Add OpenAI provider options for prompt caching (Responses API only).
-  // Why: many OpenAI-compatible proxies reject these parameters on `/chat/completions`.
-  if (
-    model.includes("gpt") &&
-    openaiApiMode === "responses" &&
-    !useOllamaForChat
-  ) {
-    const openaiOptions: OpenAIResponsesProviderOptions = {
-      promptCacheKey: cacheKey || `ingestion-${complexity}`,
-    };
-
-    // 24h retention and reasoning options only available for non-mini gpt-5 models
-    if (model.startsWith("gpt-5")) {
-      if (model.includes("mini")) {
-        openaiOptions.reasoningEffort = "low";
-      } else {
-        openaiOptions.promptCacheRetention = "24h";
-        openaiOptions.reasoningEffort = "none";
-        if (reasoningEffort) {
-          openaiOptions.reasoningEffort = reasoningEffort;
-        }
-      }
-    }
-
-    generateTextOptions.providerOptions = {
-      openai: openaiOptions,
-    };
+  const promptCacheOptions = buildOpenAIPromptCacheOptions({
+    model,
+    cacheKey: cacheKey || `ingestion-${complexity}`,
+    reasoningEffort,
+    configuredOpenaiApiMode,
+    effectiveOpenaiApiMode: openaiApiMode,
+    useOllamaForChat,
+  });
+  if (promptCacheOptions.providerOptions) {
+    generateTextOptions.providerOptions = promptCacheOptions.providerOptions;
   }
 
   if (!modelInstance) {
     throw new Error(`Unsupported model type: ${model}`);
   }
+
+  logPromptDiagnostics(
+    "request",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      promptCacheConfigured: promptCacheOptions.promptCacheConfigured,
+      promptCacheStrategy: promptCacheOptions.promptCacheStrategy,
+      stream,
+    },
+  );
 
   if (stream) {
     return streamText({
@@ -227,14 +531,28 @@ export async function makeModelCall(
               promptTokens: usage.inputTokens,
               completionTokens: usage.outputTokens,
               totalTokens: usage.totalTokens,
+              cachedInputTokens: usage.cachedInputTokens,
             }
           : undefined;
 
         if (tokenUsage) {
           logger.log(
-            `[${complexity.toUpperCase()}] ${model} - Tokens: ${tokenUsage.totalTokens} (prompt: ${tokenUsage.promptTokens}, completion: ${tokenUsage.completionTokens})`,
+            `[${complexity.toUpperCase()}] ${model} - Tokens: ${tokenUsage.totalTokens} (prompt: ${tokenUsage.promptTokens}, completion: ${tokenUsage.completionTokens}, cached: ${tokenUsage.cachedInputTokens})`,
           );
         }
+
+        logPromptDiagnostics(
+          "response",
+          model,
+          complexity,
+          promptDiagnostics,
+          telemetry,
+          {
+            cacheKey,
+            usage: tokenUsage,
+            stream,
+          },
+        );
 
         onFinish(text, model, tokenUsage);
       },
@@ -262,9 +580,107 @@ export async function makeModelCall(
     );
   }
 
+  logPromptDiagnostics(
+    "response",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      usage: tokenUsage,
+      stream,
+    },
+  );
+
   onFinish(text, model, tokenUsage);
 
   return text;
+}
+
+export async function makeTextModelCall(
+  messages: ModelMessage[],
+  options?: any,
+  complexity: ModelComplexity = "high",
+  cacheKey?: string,
+  reasoningEffort?: "low" | "medium" | "high",
+  telemetry?: ModelCallTelemetry,
+): Promise<{ text: string; usage: TokenUsage | undefined; response: any }> {
+  const model = getModelForTask(complexity);
+  logger.info(`[Text] complexity: ${complexity}, model: ${model}`);
+
+  const modelInstance = getModel(model);
+  const generateTextOptions: any = {};
+  const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
+  const openaiApiMode = getEffectiveOpenAIApiMode(model);
+  const useOllamaForChat = env.CHAT_PROVIDER === "ollama";
+  const promptDiagnostics = buildPromptDiagnostics(messages);
+  const promptCacheOptions = buildOpenAIPromptCacheOptions({
+    model,
+    cacheKey: cacheKey || `text-${complexity}`,
+    reasoningEffort,
+    configuredOpenaiApiMode,
+    effectiveOpenaiApiMode: openaiApiMode,
+    useOllamaForChat,
+  });
+  if (promptCacheOptions.providerOptions) {
+    generateTextOptions.providerOptions = promptCacheOptions.providerOptions;
+  }
+
+  logPromptDiagnostics(
+    "request",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      promptCacheConfigured: promptCacheOptions.promptCacheConfigured,
+      promptCacheStrategy: promptCacheOptions.promptCacheStrategy,
+      stream: false,
+    },
+  );
+
+  const result = await generateText({
+    model: modelInstance,
+    messages,
+    ...options,
+    ...generateTextOptions,
+  });
+
+  const tokenUsage = result.usage
+    ? {
+        promptTokens: result.usage.inputTokens,
+        completionTokens: result.usage.outputTokens,
+        totalTokens: result.usage.totalTokens,
+        cachedInputTokens: result.usage.cachedInputTokens,
+      }
+    : undefined;
+
+  if (tokenUsage) {
+    logger.log(
+      `[Text/${complexity.toUpperCase()}] ${model} - Tokens: ${tokenUsage.totalTokens} (prompt: ${tokenUsage.promptTokens}, completion: ${tokenUsage.completionTokens}, cached: ${tokenUsage.cachedInputTokens})`,
+    );
+  }
+
+  logPromptDiagnostics(
+    "response",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      usage: tokenUsage,
+      stream: false,
+    },
+  );
+
+  return {
+    text: result.text,
+    usage: tokenUsage,
+    response: result.response,
+  };
 }
 
 /**
@@ -277,8 +693,9 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
   complexity: ModelComplexity = "high",
   cacheKey?: string,
   temperature?: number,
+  telemetry?: ModelCallTelemetry,
 ): Promise<{ object: z.infer<T>; usage: TokenUsage | undefined }> {
-  const openaiApiMode = env.OPENAI_API_MODE === "chat" ? "chat_completions" : env.OPENAI_API_MODE;
+  const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
   const useOllamaForChat = env.CHAT_PROVIDER === "ollama";
 
   // Default upstream behavior expects `generateObject()` to parse strict JSON output.
@@ -294,6 +711,7 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
   // Proxy/self-hosted modes only (preserves upstream defaults):
   // - OPENAI_API_MODE=chat_completions + OPENAI_BASE_URL indicates an OpenAI-compatible proxy
   // - CHAT_PROVIDER=ollama indicates a self-hosted chat model
+  const openaiApiMode = getEffectiveOpenAIApiMode();
   const isProxyChatMode =
     openaiApiMode === "chat_completions" && !!env.OPENAI_BASE_URL;
   const isOllamaChatProvider = useOllamaForChat;
@@ -332,39 +750,46 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
 
   const modelInstance = getModel(model);
   const generateObjectOptions: any = {};
+  const promptDiagnostics = buildPromptDiagnostics(messages);
+  const promptCacheOptions = buildOpenAIPromptCacheOptions({
+    model,
+    cacheKey: cacheKey || `structured-${complexity}`,
+    configuredOpenaiApiMode,
+    effectiveOpenaiApiMode: openaiApiMode,
+    useOllamaForChat,
+  });
 
   if (temperature !== undefined) {
     generateObjectOptions.temperature = temperature;
   }
 
-  // Add OpenAI provider options for prompt caching
-  if (
-    model.includes("gpt") &&
-    openaiApiMode === "responses" &&
-    !useOllamaForChat
-  ) {
-    const openaiOptions: OpenAIResponsesProviderOptions = {
-      promptCacheKey: cacheKey || `structured-${complexity}`,
-      strictJsonSchema: false,
-    };
-
-    if (model.startsWith("gpt-5")) {
-      if (model.includes("mini")) {
-        openaiOptions.reasoningEffort = "low";
-      } else {
-        openaiOptions.promptCacheRetention = "24h";
-        openaiOptions.reasoningEffort = "none";
-      }
-    }
-
+  if (promptCacheOptions.providerOptions) {
     generateObjectOptions.providerOptions = {
-      openai: openaiOptions,
+      openai: {
+        ...promptCacheOptions.providerOptions.openai,
+        strictJsonSchema: false,
+      },
     };
   }
 
   if (!modelInstance) {
     throw new Error(`Unsupported model type: ${model}`);
   }
+
+  logPromptDiagnostics(
+    "request",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      promptCacheConfigured: promptCacheOptions.promptCacheConfigured,
+      promptCacheStrategy: promptCacheOptions.promptCacheStrategy,
+      stream: false,
+      structured: true,
+    },
+  );
 
   type ModelUsage = {
     inputTokens?: number;
@@ -525,6 +950,20 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
       `[Structured/${complexity.toUpperCase()}] ${model} - Tokens: ${tokenUsage.totalTokens} (prompt: ${tokenUsage.promptTokens}, completion: ${tokenUsage.completionTokens}, cached: ${tokenUsage.cachedInputTokens})`,
     );
   }
+
+  logPromptDiagnostics(
+    "response",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      usage: tokenUsage,
+      stream: false,
+      structured: true,
+    },
+  );
 
   if (object === undefined) {
     throw new Error("No object generated from structured model call.");
