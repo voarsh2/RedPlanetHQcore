@@ -18,6 +18,11 @@ import { type MessagePlan } from "~/services/agent/types/decision-agent";
 import { prisma } from "~/db.server";
 import { logger } from "../logger.service";
 import { getCompactedSessionBySessionId } from "../graphModels/compactedSession";
+import {
+  shouldApplyContextBudget,
+  trimMessagesToBudget,
+} from "~/lib/context-budget.server";
+import { env } from "~/env.server";
 
 interface BuildAgentContextParams {
   userId: string;
@@ -353,6 +358,25 @@ Guidelines:
     });
 
     contextMessages = recentMessages;
+  }
+
+  // Token budget guard (env-gated safety net for models with smaller context windows)
+  if (shouldApplyContextBudget()) {
+    const budgetResult = trimMessagesToBudget(
+      contextMessages,
+      env.LLM_CONTEXT_BUDGET!,
+    );
+    contextMessages = budgetResult.messages;
+
+    if (budgetResult.droppedCount > 0 || budgetResult.truncatedCount > 0) {
+      logger.info("Agent context trimmed to token budget", {
+        budget: env.LLM_CONTEXT_BUDGET,
+        totalTokens: budgetResult.totalTokens,
+        messagesDropped: budgetResult.droppedCount,
+        messagesTruncated: budgetResult.truncatedCount,
+        messagesRemaining: contextMessages.length,
+      });
+    }
   }
 
   // Convert to model messages

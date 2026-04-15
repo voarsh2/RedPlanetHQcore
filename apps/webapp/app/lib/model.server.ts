@@ -22,6 +22,10 @@ import {
   buildOpenAIPromptCacheOptions,
   type OpenAIApiMode,
 } from "~/lib/openai-proxy-wire.server";
+import {
+  shouldApplyContextBudget,
+  trimMessagesToBudget,
+} from "~/lib/context-budget.server";
 
 export type ModelComplexity = "high" | "low";
 export type OpenAIApiMode = "responses" | "chat_completions";
@@ -319,10 +323,30 @@ export async function makeModelCall(
     },
   );
 
+  // Token budget guard (env-gated safety net for models with smaller context windows)
+  let trimmedMessages = messages;
+  if (shouldApplyContextBudget()) {
+    const budgetResult = trimMessagesToBudget(messages, env.LLM_CONTEXT_BUDGET!);
+    trimmedMessages = budgetResult.messages as ModelMessage[];
+
+    if (budgetResult.droppedCount > 0 || budgetResult.truncatedCount > 0) {
+      logger.info("Model call trimmed to token budget", {
+        model,
+        complexity,
+        callSite: telemetry?.callSite,
+        budget: env.LLM_CONTEXT_BUDGET,
+        totalTokens: budgetResult.totalTokens,
+        messagesDropped: budgetResult.droppedCount,
+        messagesTruncated: budgetResult.truncatedCount,
+        messagesRemaining: trimmedMessages.length,
+      });
+    }
+  }
+
   if (stream) {
     return streamText({
       model: modelInstance,
-      messages,
+      messages: trimmedMessages,
       ...options,
       ...generateTextOptions,
       onFinish: async ({ text, usage }) => {
@@ -442,9 +466,29 @@ export async function makeTextModelCall(
     },
   );
 
+  // Token budget guard
+  let trimmedMessages = messages;
+  if (shouldApplyContextBudget()) {
+    const budgetResult = trimMessagesToBudget(messages, env.LLM_CONTEXT_BUDGET!);
+    trimmedMessages = budgetResult.messages as ModelMessage[];
+
+    if (budgetResult.droppedCount > 0 || budgetResult.truncatedCount > 0) {
+      logger.info("Model call trimmed to token budget", {
+        model,
+        complexity,
+        callSite: telemetry?.callSite,
+        budget: env.LLM_CONTEXT_BUDGET,
+        totalTokens: budgetResult.totalTokens,
+        messagesDropped: budgetResult.droppedCount,
+        messagesTruncated: budgetResult.truncatedCount,
+        messagesRemaining: trimmedMessages.length,
+      });
+    }
+  }
+
   const result = await generateText({
     model: modelInstance,
-    messages,
+    messages: trimmedMessages,
     ...options,
     ...generateTextOptions,
   });
@@ -593,6 +637,26 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
     },
   );
 
+  // Token budget guard
+  let trimmedMessages = messages;
+  if (shouldApplyContextBudget()) {
+    const budgetResult = trimMessagesToBudget(messages, env.LLM_CONTEXT_BUDGET!);
+    trimmedMessages = budgetResult.messages as ModelMessage[];
+
+    if (budgetResult.droppedCount > 0 || budgetResult.truncatedCount > 0) {
+      logger.info("Model call trimmed to token budget", {
+        model,
+        complexity,
+        callSite: telemetry?.callSite,
+        budget: env.LLM_CONTEXT_BUDGET,
+        totalTokens: budgetResult.totalTokens,
+        messagesDropped: budgetResult.droppedCount,
+        messagesTruncated: budgetResult.truncatedCount,
+        messagesRemaining: trimmedMessages.length,
+      });
+    }
+  }
+
   type ModelUsage = {
     inputTokens?: number;
     outputTokens?: number;
@@ -647,7 +711,7 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
 
       const textResult = await generateText({
         model: modelInstance,
-        messages: [jsonOnlyPreamble, ...messages],
+        messages: [jsonOnlyPreamble, ...trimmedMessages],
         temperature: generateObjectOptions.temperature,
       });
 
@@ -697,7 +761,7 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
       const result = await generateObject({
         model: modelInstance,
         schema,
-        messages,
+        messages: trimmedMessages,
         ...generateObjectOptions,
       });
       object = result.object;
