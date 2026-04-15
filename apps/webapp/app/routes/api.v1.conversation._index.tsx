@@ -158,7 +158,10 @@ const { loader, action } = createHybridActionApiRoute(
       "high",
       "core-agent-chat",
       undefined,
-      { callSite: "core.agent.chat.stream" },
+      {
+        callSite: "core.agent.chat.stream",
+        proxyAffinityKey: `conversation:${body.id}`,
+      },
     );
 
     result.consumeStream(); // no await

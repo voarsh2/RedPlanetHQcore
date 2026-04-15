@@ -19,6 +19,10 @@ import { createOllama } from "ollama-ai-provider-v2";
 import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
 import { env } from "~/env.server";
+import {
+  getStoredProxyPreviousResponseId,
+  storeProxyPreviousResponseId,
+} from "~/lib/openai-proxy-turn-state.server";
 
 export type ModelComplexity = "high" | "low";
 export type OpenAIApiMode = "responses" | "chat_completions";
@@ -167,6 +171,8 @@ export function getConfiguredOpenAIApiMode(): OpenAIApiMode {
 }
 
 export function shouldForceProxyResponsesForModel(model?: string): boolean {
+  // TODO(upstream-split): forcing proxy GPT traffic onto /responses is a targeted
+  // compatibility/cache experiment for our proxy, not a generic OpenAI-compatible rule.
   if (!env.OPENAI_BASE_URL || env.CHAT_PROVIDER === "ollama") return false;
   if (!env.OPENAI_PROXY_FORCE_RESPONSES) return false;
 
@@ -181,6 +187,10 @@ export function getEffectiveOpenAIApiMode(model?: string): OpenAIApiMode {
   return shouldForceProxyResponsesForModel(model)
     ? "responses"
     : getConfiguredOpenAIApiMode();
+}
+
+function shouldEnableProxyContinuityExperiment(): boolean {
+  return !!env.OPENAI_BASE_URL && env.OPENAI_PROXY_ENABLE_CONTINUITY_EXPERIMENT;
 }
 
 function extractUrlString(input: unknown): string {
@@ -221,6 +231,11 @@ function writeOpenAIWireBody(
   appendFileSync(path.join(logDir, `${eventId}.${phase}.json`), body, "utf8");
 }
 
+export interface ModelCallTelemetry {
+  callSite?: string;
+  proxyAffinityKey?: string;
+}
+
 function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
   return async (input, init) => {
     const url = extractUrlString(input);
@@ -232,12 +247,15 @@ function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         ? (input as { method: string }).method
         : undefined;
     const method = (init?.method || inputMethod || "GET").toUpperCase();
+    const isResponsesRequest = method === "POST" && url.includes("/responses");
+    const isProxyResponsesRequest = isResponsesRequest && !!env.OPENAI_BASE_URL;
+    const shouldApplyProxyContinuityExperiment =
+      isProxyResponsesRequest && shouldEnableProxyContinuityExperiment();
     const shouldLogRequest =
       env.LLM_LOG_OPENAI_WIRE &&
-      method === "POST" &&
-      url.includes("/responses");
+      isResponsesRequest;
 
-    if (!shouldLogRequest) {
+    if (!shouldApplyProxyContinuityExperiment && !shouldLogRequest) {
       return baseFetch(input, init);
     }
 
@@ -257,44 +275,89 @@ function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
       }
     }
 
+    const promptCacheKey = normalizeProxyValue(parsedBody?.prompt_cache_key);
+    // TODO(upstream-split): replaying previous_response_id is proxy-specific continuity
+    // glue. Keep this separate from the broadly portable prompt-trimming work.
+    const previousResponseId =
+      shouldApplyProxyContinuityExperiment &&
+      parsedBody &&
+      typeof parsedBody.previous_response_id !== "string"
+        ? getStoredProxyPreviousResponseId(promptCacheKey)
+        : undefined;
+    const proxyAffinityKey = promptCacheKey;
+    const proxyAffinityHash = proxyAffinityKey
+      ? hashProxyValue(proxyAffinityKey)
+      : undefined;
+
+    if (previousResponseId && parsedBody) {
+      parsedBody.previous_response_id = previousResponseId;
+    }
+
     const inputItems = Array.isArray(parsedBody?.input)
       ? (parsedBody.input as unknown[])
       : [];
-    const serializedBody = rawBody || JSON.stringify(parsedBody || {});
+    const serializedBody = JSON.stringify(parsedBody || {});
     const eventId = crypto.randomUUID();
 
-    logOpenAIWireEvent({
-      event: "request",
-      eventId,
-      timestamp: new Date().toISOString(),
-      url,
-      method,
-      bodyHash: createHash("sha256").update(serializedBody).digest("hex"),
-      bodyChars: serializedBody.length,
-      hasPromptCacheKey: typeof parsedBody?.prompt_cache_key === "string",
-      promptCacheKey: parsedBody?.prompt_cache_key,
-      promptCacheRetention: parsedBody?.prompt_cache_retention,
-      store: parsedBody?.store,
-      stream: parsedBody?.stream,
-      model: parsedBody?.model,
-      hasInstructions: typeof parsedBody?.instructions === "string",
-      instructionsChars:
-        typeof parsedBody?.instructions === "string"
-          ? parsedBody.instructions.length
-          : 0,
-      toolsCount: Array.isArray(parsedBody?.tools) ? parsedBody.tools.length : 0,
-      toolChoice: parsedBody?.tool_choice,
-      parallelToolCalls: parsedBody?.parallel_tool_calls,
-      serviceTier: parsedBody?.service_tier,
-      reasoning: parsedBody?.reasoning,
-      text: parsedBody?.text,
-      include: parsedBody?.include,
-      inputCount: inputItems.length,
-      inputPreview: inputItems.slice(0, 3),
-    });
-    writeOpenAIWireBody(eventId, "request", serializedBody);
+    if (shouldLogRequest) {
+      logOpenAIWireEvent({
+        event: "request",
+        eventId,
+        timestamp: new Date().toISOString(),
+        url,
+        method,
+        bodyHash: createHash("sha256").update(serializedBody).digest("hex"),
+        bodyChars: serializedBody.length,
+        hasPromptCacheKey: typeof parsedBody?.prompt_cache_key === "string",
+        promptCacheKey: parsedBody?.prompt_cache_key,
+        promptCacheRetention: parsedBody?.prompt_cache_retention,
+        store: parsedBody?.store,
+        stream: parsedBody?.stream,
+        model: parsedBody?.model,
+        hasInstructions: typeof parsedBody?.instructions === "string",
+        instructionsChars:
+          typeof parsedBody?.instructions === "string"
+            ? parsedBody.instructions.length
+            : 0,
+        toolsCount: Array.isArray(parsedBody?.tools) ? parsedBody.tools.length : 0,
+        toolChoice: parsedBody?.tool_choice,
+        parallelToolCalls: parsedBody?.parallel_tool_calls,
+        serviceTier: parsedBody?.service_tier,
+        proxyAffinityKey,
+        proxyAffinityHash,
+        previousResponseIdHash: previousResponseId
+          ? hashProxyValue(previousResponseId)
+          : undefined,
+        reasoning: parsedBody?.reasoning,
+        text: parsedBody?.text,
+        include: parsedBody?.include,
+        inputCount: inputItems.length,
+        inputPreview: inputItems.slice(0, 3),
+      });
+      writeOpenAIWireBody(eventId, "request", serializedBody);
+    }
 
-    const response = await baseFetch(input, init);
+    const response = await baseFetch(
+      input,
+      previousResponseId || rawBody
+        ? {
+            ...(init || {}),
+            body: serializedBody,
+          }
+        : init,
+    );
+    if (shouldApplyProxyContinuityExperiment) {
+      void response
+        .clone()
+        .text()
+        .then((body) => {
+          storeProxyPreviousResponseId(
+            promptCacheKey,
+            extractProxyResponseId(body),
+          );
+        })
+        .catch(() => {});
+    }
     let responseBody = "";
     if (env.LLM_LOG_OPENAI_WIRE_BODIES) {
       try {
@@ -303,20 +366,54 @@ function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         responseBody = "";
       }
     }
-    logOpenAIWireEvent({
-      event: "response",
-      eventId,
-      timestamp: new Date().toISOString(),
-      url,
-      method,
-      status: response.status,
-      ok: response.ok,
-    });
-    if (responseBody) {
-      writeOpenAIWireBody(eventId, "response", responseBody);
+    if (shouldLogRequest) {
+      logOpenAIWireEvent({
+        event: "response",
+        eventId,
+        timestamp: new Date().toISOString(),
+        url,
+        method,
+        status: response.status,
+        ok: response.ok,
+      });
+      if (responseBody) {
+        writeOpenAIWireBody(eventId, "response", responseBody);
+      }
     }
     return response;
   };
+}
+
+function extractProxyResponseId(body: string): string | undefined {
+  const trimmed = body.trim();
+  if (!trimmed) return undefined;
+
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        id?: unknown;
+        response?: { id?: unknown };
+      };
+      return normalizeProxyValue(parsed.id ?? parsed.response?.id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  for (const line of trimmed.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    try {
+      const parsed = JSON.parse(line.slice(6)) as {
+        response?: { id?: unknown };
+      };
+      const id = normalizeProxyValue(parsed.response?.id);
+      if (id) return id;
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
 }
 
 export interface TokenUsage {
@@ -326,15 +423,33 @@ export interface TokenUsage {
   cachedInputTokens?: number;
 }
 
-export interface ModelCallTelemetry {
-  callSite?: string;
-}
-
 interface PromptDiagnostics {
   promptChars: number;
   promptHash: string;
   promptPrefixHash: string;
   messageCount: number;
+}
+
+function normalizeProxyValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 256);
+}
+
+function hashProxyValue(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function buildProxyPromptCacheKey(
+  cacheKey: string | undefined,
+  telemetry: ModelCallTelemetry | undefined,
+): string | undefined {
+  const normalizedCacheKey = normalizeProxyValue(cacheKey);
+
+  return normalizeProxyValue(
+    telemetry?.proxyAffinityKey || normalizedCacheKey || telemetry?.callSite,
+  );
 }
 
 function buildOpenAIPromptCacheOptions({
@@ -344,6 +459,7 @@ function buildOpenAIPromptCacheOptions({
   configuredOpenaiApiMode,
   effectiveOpenaiApiMode,
   useOllamaForChat,
+  telemetry,
 }: {
   model: string;
   cacheKey?: string;
@@ -351,6 +467,7 @@ function buildOpenAIPromptCacheOptions({
   configuredOpenaiApiMode: OpenAIApiMode;
   effectiveOpenaiApiMode: OpenAIApiMode;
   useOllamaForChat: boolean;
+  telemetry?: ModelCallTelemetry;
 }): {
   providerOptions?: { openai: Record<string, unknown> };
   promptCacheConfigured: boolean;
@@ -380,6 +497,15 @@ function buildOpenAIPromptCacheOptions({
   const openaiOptions: Record<string, unknown> = {
     promptCacheKey: cacheKey || `model-call`,
   };
+
+  if (isResponsesMode) {
+    if (isProxyResponsesMode && shouldEnableProxyContinuityExperiment()) {
+      const proxyPromptCacheKey = buildProxyPromptCacheKey(cacheKey, telemetry);
+      if (proxyPromptCacheKey) {
+        openaiOptions.promptCacheKey = proxyPromptCacheKey;
+      }
+    }
+  }
 
   if (model.startsWith("gpt-5")) {
     if (model.includes("mini")) {
@@ -496,6 +622,7 @@ export async function makeModelCall(
     configuredOpenaiApiMode,
     effectiveOpenaiApiMode: openaiApiMode,
     useOllamaForChat,
+    telemetry,
   });
   if (promptCacheOptions.providerOptions) {
     generateTextOptions.providerOptions = promptCacheOptions.providerOptions;
@@ -622,6 +749,7 @@ export async function makeTextModelCall(
     configuredOpenaiApiMode,
     effectiveOpenaiApiMode: openaiApiMode,
     useOllamaForChat,
+    telemetry,
   });
   if (promptCacheOptions.providerOptions) {
     generateTextOptions.providerOptions = promptCacheOptions.providerOptions;
@@ -757,6 +885,7 @@ export async function makeStructuredModelCall<T extends z.ZodType>(
     configuredOpenaiApiMode,
     effectiveOpenaiApiMode: openaiApiMode,
     useOllamaForChat,
+    telemetry,
   });
 
   if (temperature !== undefined) {

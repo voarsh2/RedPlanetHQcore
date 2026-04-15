@@ -141,6 +141,11 @@ const EnvironmentSchema = z
       .optional()
       .default("false")
       .transform((val) => val === "true" || val === "1"),
+    OPENAI_PROXY_ENABLE_CONTINUITY_EXPERIMENT: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
     OLLAMA_URL: z.string().optional(),
     CHAT_PROVIDER: z.enum(["openai", "ollama"]).default("openai"),
     EMBEDDINGS_PROVIDER: z.enum(["openai", "ollama"]).optional(),

@@ -124,7 +124,10 @@ export async function noStreamProcess(
     "high",
     "core-agent-chat",
     undefined,
-    { callSite: "core.agent.chat.nostream" },
+    {
+      callSite: "core.agent.chat.nostream",
+      proxyAffinityKey: `conversation:${body.id}`,
+    },
   );
 
   // Create assistant message with UI-compatible parts

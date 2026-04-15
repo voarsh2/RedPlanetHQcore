@@ -593,6 +593,11 @@ export class KnowledgeGraphService {
       undefined,
       "high",
       "normalization",
+      undefined,
+      {
+        callSite: "core.ingest.normalization",
+        proxyAffinityKey: `workspace:${workspaceId}:normalization`,
+      },
     );
     let normalizedEpisodeBody = "";
     const outputMatch = responseText.match(/<output>([\s\S]*?)<\/output>/);
