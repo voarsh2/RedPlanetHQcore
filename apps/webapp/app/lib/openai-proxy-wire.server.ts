@@ -109,9 +109,36 @@ function extractUrlString(input: unknown): string {
   return "";
 }
 
-// Stable session identifier for this process lifetime — used as session_id
-// header so Claw Bay routes all requests from this instance to the same backend.
-const PROXY_SESSION_ID = randomUUID();
+// Stable session identifiers per request category — used as session_id
+// header so Claw Bay routes requests to consistent backends.
+// Separate IDs per category prevent concurrent requests from racing
+// on the same prompt_cache_key namespace (which causes cache invalidation).
+const PROXY_SESSION_IDS: Record<string, string> = {
+  conversation: randomUUID(),
+  "session-compaction": randomUUID(),
+  normalization: randomUUID(),
+  "label-extraction": randomUUID(),
+  "combined-extraction": randomUUID(),
+  default: randomUUID(),
+};
+
+function getSessionIdForCacheKey(
+  cacheKey: string | undefined,
+): string {
+  if (!cacheKey) return PROXY_SESSION_IDS.default;
+
+  // conversation:* keys → chat session
+  if (cacheKey.startsWith("conversation:")) return PROXY_SESSION_IDS.conversation;
+
+  // Known job key patterns (may be prefixed with workspace:uuid:)
+  if (cacheKey.includes("normalization")) return PROXY_SESSION_IDS.normalization;
+  if (cacheKey.includes("label-extraction")) return PROXY_SESSION_IDS["label-extraction"];
+  if (cacheKey.includes("combined-extraction")) return PROXY_SESSION_IDS["combined-extraction"];
+  if (cacheKey.includes("session-compaction")) return PROXY_SESSION_IDS["session-compaction"];
+
+  // Hash-derived keys (16-char hex) → default session
+  return PROXY_SESSION_IDS.default;
+}
 
 export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
 
@@ -204,11 +231,14 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
     // Build headers for sticky session routing on Claw Bay.
     // For codex-native traffic: session_id header routes to the same backend.
     // For OpenAI-compatible traffic: prompt_cache_key in the body handles routing.
+    // Use a category-specific session ID to prevent concurrent requests with
+    // different prompt_cache_keys from racing on the same backend.
+    const categorySessionId = getSessionIdForCacheKey(promptCacheKey);
     const continuityHeaders: Record<string, string> =
       shouldApplyProxyContinuityExperiment
         ? {
-            session_id: PROXY_SESSION_ID,
-            "x-client-request-id": PROXY_SESSION_ID,
+            session_id: categorySessionId,
+            "x-client-request-id": categorySessionId,
           }
         : {};
 
@@ -246,7 +276,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         include: parsedBody?.include,
         inputCount: inputItems.length,
         inputPreview: inputItems.slice(0, 3),
-        sessionIdHeader: PROXY_SESSION_ID,
+        sessionIdHeader: categorySessionId,
         hasSessionIdHeader: Object.keys(continuityHeaders).length > 0,
       });
       writeOpenAIWireBody(eventId, "request", serializedBody);
