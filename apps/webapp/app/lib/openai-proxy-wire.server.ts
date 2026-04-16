@@ -15,7 +15,125 @@ import { logger } from "~/services/logger.service";
 import type { ModelCallTelemetry } from "~/lib/model.server";
 
 // ---------------------------------------------------------------------------
-// Proxy continuity experiment gate
+// Generic wire types
+// ---------------------------------------------------------------------------
+
+type ParsedProxyWireBody = Record<string, unknown>;
+type ProxyRequestKind = "responses" | "chat_completions";
+type ProxyRequestBodyKey = "input" | "messages";
+
+type OpenAIWireRequestContext = {
+  url: string;
+  method: string;
+  requestType: ProxyRequestKind;
+  requestBodyKey: ProxyRequestBodyKey;
+  isProxyRequest: boolean;
+  shouldLogRequest: boolean;
+  shouldApplyBudgetTrim: boolean;
+  shouldApplyProxyContinuityExperiment: boolean;
+};
+
+type BudgetTrimInfo = {
+  applied: boolean;
+  bodyTokensBefore: number;
+  bodyTokensAfter: number;
+  bodyCharsBefore: number;
+  bodyCharsAfter: number;
+  inputCountBefore: number;
+  inputCountAfter: number;
+  messagesDropped: number;
+  messagesTruncated: number;
+};
+
+// ---------------------------------------------------------------------------
+// Generic wire logging
+// ---------------------------------------------------------------------------
+
+function logProxyWireIntercept(context: OpenAIWireRequestContext) {
+  logger.info("Proxy wire intercept", {
+    url: context.url,
+    method: context.method,
+    requestType: context.requestType,
+    hasOpenAIBaseUrl: !!env.OPENAI_BASE_URL,
+    shouldLogRequest: context.shouldLogRequest,
+    shouldApplyBudgetTrim: context.shouldApplyBudgetTrim,
+    shouldApplyProxyContinuityExperiment:
+      context.shouldApplyProxyContinuityExperiment,
+  });
+}
+
+function logProxyWireBudgetEvaluation(
+  context: OpenAIWireRequestContext,
+  budgetTrimInfo: BudgetTrimInfo,
+  rawBody: string | undefined,
+  parsedBody: ParsedProxyWireBody | undefined,
+) {
+  logger.info("Proxy wire request budget evaluation", {
+    requestType: context.requestType,
+    configuredBudget: env.LLM_CONTEXT_BUDGET,
+    effectiveWireBudget: env.LLM_CONTEXT_BUDGET,
+    effectiveWireCharBudget: env.LLM_CONTEXT_BUDGET * 4,
+    bodyTokensBefore: budgetTrimInfo.bodyTokensBefore,
+    bodyTokensAfter: budgetTrimInfo.bodyTokensAfter,
+    bodyCharsBefore: budgetTrimInfo.bodyCharsBefore,
+    bodyCharsAfter: budgetTrimInfo.bodyCharsAfter,
+    messageArrayKey: context.requestBodyKey,
+    inputCountBefore: budgetTrimInfo.inputCountBefore,
+    inputCountAfter: budgetTrimInfo.inputCountAfter,
+    messagesDropped: budgetTrimInfo.messagesDropped,
+    messagesTruncated: budgetTrimInfo.messagesTruncated,
+    hasRawBody: !!rawBody,
+    bodyParseSucceeded: !!parsedBody,
+    model: parsedBody?.model,
+    trimmed: budgetTrimInfo.applied,
+  });
+}
+
+function logProxyWireTrimmed(
+  context: OpenAIWireRequestContext,
+  budgetTrimInfo: BudgetTrimInfo,
+  parsedBody: ParsedProxyWireBody | undefined,
+) {
+  logger.info("Proxy wire request trimmed to token budget", {
+    requestType: context.requestType,
+    configuredBudget: env.LLM_CONTEXT_BUDGET,
+    effectiveWireBudget: env.LLM_CONTEXT_BUDGET,
+    effectiveWireCharBudget: env.LLM_CONTEXT_BUDGET * 4,
+    bodyTokensBefore: budgetTrimInfo.bodyTokensBefore,
+    bodyTokensAfter: budgetTrimInfo.bodyTokensAfter,
+    bodyCharsBefore: budgetTrimInfo.bodyCharsBefore,
+    bodyCharsAfter: budgetTrimInfo.bodyCharsAfter,
+    messageArrayKey: context.requestBodyKey,
+    inputCountBefore: budgetTrimInfo.inputCountBefore,
+    inputCountAfter: budgetTrimInfo.inputCountAfter,
+    messagesDropped: budgetTrimInfo.messagesDropped,
+    messagesTruncated: budgetTrimInfo.messagesTruncated,
+    model: parsedBody?.model,
+  });
+}
+
+function logProxyWireResponseSummary(
+  context: OpenAIWireRequestContext,
+  response: Response,
+  responseBody: string,
+) {
+  const responseContentType = response.headers.get("content-type");
+  const responseBodyPreview =
+    responseBody.length > 0 ? responseBody.slice(0, 400) : undefined;
+
+  logger.info("Proxy wire response summary", {
+    requestType: context.requestType,
+    status: response.status,
+    ok: response.ok,
+    contentType: responseContentType,
+    hasBody: responseBody.length > 0,
+    responseBodyChars: responseBody.length || 0,
+    responseBodyPreview,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Claw Bay continuity experiment gate
 // ---------------------------------------------------------------------------
 
 function shouldEnableProxyContinuityExperiment(): boolean {
@@ -98,7 +216,7 @@ function extractProxyResponseId(body: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// buildOpenAIWireFetch — intercepts /responses requests to the proxy
+// Generic wire request helpers
 // ---------------------------------------------------------------------------
 
 function extractUrlString(input: unknown): string {
@@ -114,6 +232,124 @@ function extractUrlString(input: unknown): string {
   }
   return "";
 }
+
+function buildOpenAIWireRequestContext(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): OpenAIWireRequestContext | null {
+  const url = extractUrlString(input);
+  const inputMethod =
+    input &&
+    typeof input === "object" &&
+    "method" in input &&
+    typeof (input as { method?: unknown }).method === "string"
+      ? (input as { method: string }).method
+      : undefined;
+  const method = (init?.method || inputMethod || "GET").toUpperCase();
+  const isResponsesRequest = method === "POST" && url.includes("/responses");
+  const isChatCompletionsRequest =
+    method === "POST" && url.includes("/chat/completions");
+
+  if (!isResponsesRequest && !isChatCompletionsRequest) {
+    return null;
+  }
+
+  const requestType: ProxyRequestKind = isResponsesRequest
+    ? "responses"
+    : "chat_completions";
+  const requestBodyKey: ProxyRequestBodyKey = isChatCompletionsRequest
+    ? "messages"
+    : "input";
+  const isProxyRequest = !!env.OPENAI_BASE_URL;
+  const shouldLogRequest = env.LLM_LOG_OPENAI_WIRE;
+  const shouldApplyBudgetTrim = isProxyRequest && shouldApplyContextBudget();
+  const shouldApplyProxyContinuityExperiment =
+    requestType === "responses" &&
+    isProxyRequest &&
+    shouldEnableProxyContinuityExperiment();
+
+  return {
+    url,
+    method,
+    requestType,
+    requestBodyKey,
+    isProxyRequest,
+    shouldLogRequest,
+    shouldApplyBudgetTrim,
+    shouldApplyProxyContinuityExperiment,
+  };
+}
+
+async function extractRawRequestBody(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Promise<string | undefined> {
+  let rawBody =
+    typeof init?.body === "string"
+      ? init.body
+      : typeof (input as { body?: unknown } | undefined)?.body === "string"
+        ? ((input as { body?: string }).body as string)
+        : undefined;
+
+  if (!rawBody && input instanceof Request) {
+    try {
+      const requestText = await input.clone().text();
+      rawBody = requestText.length > 0 ? requestText : undefined;
+    } catch {
+      rawBody = undefined;
+    }
+  }
+
+  return rawBody;
+}
+
+function parseProxyWireBody(
+  rawBody: string | undefined,
+): ParsedProxyWireBody | undefined {
+  if (!rawBody) return undefined;
+
+  try {
+    return JSON.parse(rawBody) as ParsedProxyWireBody;
+  } catch {
+    return undefined;
+  }
+}
+
+function getRequestMessagesForTrim(
+  parsedBody: ParsedProxyWireBody | undefined,
+): unknown[] {
+  if (Array.isArray(parsedBody?.input)) {
+    return parsedBody.input as unknown[];
+  }
+  if (Array.isArray(parsedBody?.messages)) {
+    return parsedBody.messages as unknown[];
+  }
+  return [];
+}
+
+function mergeRequestHeaders(
+  headers: RequestInit["headers"],
+): Record<string, string> {
+  const mergedHeaders: Record<string, string> = {};
+
+  if (headers instanceof Headers) {
+    headers.forEach((v, k) => {
+      mergedHeaders[k] = v;
+    });
+  } else if (Array.isArray(headers)) {
+    for (const [k, v] of headers) {
+      mergedHeaders[k] = v;
+    }
+  } else if (headers && typeof headers === "object") {
+    Object.assign(mergedHeaders, headers);
+  }
+
+  return mergedHeaders;
+}
+
+// ---------------------------------------------------------------------------
+// Claw Bay continuity / cache-affinity helpers
+// ---------------------------------------------------------------------------
 
 // Stable session identifiers per request category — used as session_id
 // header so Claw Bay routes requests to consistent backends.
@@ -146,291 +382,269 @@ function getSessionIdForCacheKey(
   return PROXY_SESSION_IDS.default;
 }
 
+function deriveClawBayEffectiveCacheKey(
+  parsedBody: ParsedProxyWireBody | undefined,
+  requestBodyKey: ProxyRequestBodyKey,
+): string | undefined {
+  const promptCacheKey = normalizeProxyValue(parsedBody?.prompt_cache_key);
+  if (promptCacheKey) return promptCacheKey;
+  if (!parsedBody) return undefined;
+
+  const inputPreview = Array.isArray(parsedBody[requestBodyKey])
+    ? JSON.stringify(parsedBody[requestBodyKey]).slice(0, 256)
+    : typeof parsedBody.instructions === "string"
+      ? parsedBody.instructions.slice(0, 256)
+      : "";
+  if (!inputPreview) return undefined;
+
+  return hashProxyValue(inputPreview).slice(0, 16);
+}
+
+function getClawBayPreviousResponseId(
+  parsedBody: ParsedProxyWireBody | undefined,
+  effectiveCacheKey: string | undefined,
+  shouldApplyProxyContinuityExperiment: boolean,
+): string | undefined {
+  if (
+    !shouldApplyProxyContinuityExperiment ||
+    !parsedBody ||
+    typeof parsedBody.previous_response_id === "string"
+  ) {
+    return undefined;
+  }
+
+  return getStoredProxyPreviousResponseId(effectiveCacheKey);
+}
+
+function applyClawBayRequestMutations(
+  parsedBody: ParsedProxyWireBody | undefined,
+  effectiveCacheKey: string | undefined,
+  previousResponseId: string | undefined,
+  shouldApplyProxyContinuityExperiment: boolean,
+) {
+  if (!parsedBody) return;
+
+  if (previousResponseId) {
+    parsedBody.previous_response_id = previousResponseId;
+  }
+
+  if (!shouldApplyProxyContinuityExperiment) return;
+
+  if (typeof parsedBody.prompt_cache_key !== "string" && effectiveCacheKey) {
+    parsedBody.prompt_cache_key = effectiveCacheKey;
+  }
+  if (typeof parsedBody.store !== "boolean") {
+    parsedBody.store = true;
+  }
+}
+
+function buildClawBayContinuityHeaders(
+  effectiveCacheKey: string | undefined,
+  shouldApplyProxyContinuityExperiment: boolean,
+): Record<string, string> {
+  if (!shouldApplyProxyContinuityExperiment) {
+    return {};
+  }
+
+  const categorySessionId = getSessionIdForCacheKey(effectiveCacheKey);
+  return {
+    session_id: categorySessionId,
+    "x-client-request-id": categorySessionId,
+  };
+}
+
+function maybePersistClawBayPreviousResponseId(
+  response: Response,
+  effectiveCacheKey: string | undefined,
+  shouldApplyProxyContinuityExperiment: boolean,
+) {
+  if (!shouldApplyProxyContinuityExperiment) return;
+
+  void response
+    .clone()
+    .text()
+    .then((body) => {
+      storeProxyPreviousResponseId(
+        effectiveCacheKey,
+        extractProxyResponseId(body),
+      );
+    })
+    .catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Generic wire trimming
+// ---------------------------------------------------------------------------
+
+function applyGenericWireBudgetTrim(params: {
+  parsedBody: ParsedProxyWireBody | undefined;
+  inputItems: unknown[];
+  requestBodyKey: ProxyRequestBodyKey;
+  shouldApplyBudgetTrim: boolean;
+}): { inputItems: unknown[]; budgetTrimInfo?: BudgetTrimInfo } {
+  const { parsedBody, requestBodyKey, shouldApplyBudgetTrim } = params;
+  let { inputItems } = params;
+
+  if (!shouldApplyBudgetTrim || !parsedBody || inputItems.length === 0) {
+    return { inputItems, budgetTrimInfo: undefined };
+  }
+
+  const effectiveWireBudget = env.LLM_CONTEXT_BUDGET;
+  const effectiveWireCharBudget = effectiveWireBudget * 4;
+  let serializedBody = JSON.stringify(parsedBody);
+  let bodyTokens = countTokens(serializedBody);
+  let bodyChars = serializedBody.length;
+  const bodyTokensBefore = bodyTokens;
+  const bodyCharsBefore = bodyChars;
+  const inputCountBefore = inputItems.length;
+  let messagesDropped = 0;
+  let messagesTruncated = 0;
+
+  if (bodyTokens > effectiveWireBudget || bodyChars > effectiveWireCharBudget) {
+    let working = [...inputItems];
+    let lastLength = working.length;
+    let lastBodyTokens = bodyTokens;
+    let lastBodyChars = bodyChars;
+
+    while (
+      working.length > 0 &&
+      (bodyTokens > effectiveWireBudget || bodyChars > effectiveWireCharBudget)
+    ) {
+      const emptyInputTokens = countTokens(
+        JSON.stringify({ ...parsedBody, [requestBodyKey]: [] }),
+      );
+      const remainingInputBudget = Math.max(
+        effectiveWireBudget - emptyInputTokens,
+        0,
+      );
+      const result = trimMessagesToBudget(working, remainingInputBudget);
+
+      if (
+        result.droppedCount === 0 &&
+        result.truncatedCount === 0 &&
+        working.length === lastLength
+      ) {
+        break;
+      }
+
+      working = result.messages;
+      messagesDropped += result.droppedCount;
+      messagesTruncated += result.truncatedCount;
+      parsedBody[requestBodyKey] = working;
+      serializedBody = JSON.stringify(parsedBody);
+      bodyTokens = countTokens(serializedBody);
+      bodyChars = serializedBody.length;
+
+      if (
+        bodyTokens >= lastBodyTokens &&
+        bodyChars >= lastBodyChars &&
+        working.length === lastLength
+      ) {
+        break;
+      }
+
+      lastLength = working.length;
+      lastBodyTokens = bodyTokens;
+      lastBodyChars = bodyChars;
+    }
+
+    inputItems = working;
+  }
+
+  return {
+    inputItems,
+    budgetTrimInfo: {
+      applied:
+        bodyTokensBefore > effectiveWireBudget ||
+        bodyCharsBefore > effectiveWireCharBudget,
+      bodyTokensBefore,
+      bodyTokensAfter: bodyTokens,
+      bodyCharsBefore,
+      bodyCharsAfter: bodyChars,
+      inputCountBefore,
+      inputCountAfter: inputItems.length,
+      messagesDropped,
+      messagesTruncated,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// buildOpenAIWireFetch — single-file generic pipeline + Claw Bay hooks
+// ---------------------------------------------------------------------------
+
 export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
 
   return async (input, init) => {
-    const url = extractUrlString(input);
-    const inputMethod =
-      input &&
-      typeof input === "object" &&
-      "method" in input &&
-      typeof (input as { method?: unknown }).method === "string"
-        ? (input as { method: string }).method
-        : undefined;
-    const method = (init?.method || inputMethod || "GET").toUpperCase();
-    const isResponsesRequest = method === "POST" && url.includes("/responses");
-    const isChatCompletionsRequest =
-      method === "POST" && url.includes("/chat/completions");
-    const isInterceptedOpenAIRequest =
-      isResponsesRequest || isChatCompletionsRequest;
-    const isProxyOpenAIRequest = isInterceptedOpenAIRequest && !!env.OPENAI_BASE_URL;
-    const requestBodyKey = isChatCompletionsRequest ? "messages" : "input";
-    const shouldApplyProxyContinuityExperiment =
-      isResponsesRequest &&
-      isProxyOpenAIRequest &&
-      shouldEnableProxyContinuityExperiment();
-    const shouldLogRequest = env.LLM_LOG_OPENAI_WIRE && isInterceptedOpenAIRequest;
-    const shouldApplyBudgetTrim = isProxyOpenAIRequest && shouldApplyContextBudget();
-
-    if (isInterceptedOpenAIRequest) {
-      logger.info("Proxy wire intercept", {
-        url,
-        method,
-        requestType: isResponsesRequest ? "responses" : "chat_completions",
-        hasOpenAIBaseUrl: !!env.OPENAI_BASE_URL,
-        shouldLogRequest,
-        shouldApplyBudgetTrim,
-        shouldApplyProxyContinuityExperiment,
-      });
+    const context = buildOpenAIWireRequestContext(input, init);
+    if (!context) {
+      return baseFetch(input, init);
     }
 
+    logProxyWireIntercept(context);
+
     if (
-      !shouldApplyProxyContinuityExperiment &&
-      !shouldLogRequest &&
-      !shouldApplyBudgetTrim
+      !context.shouldApplyProxyContinuityExperiment &&
+      !context.shouldLogRequest &&
+      !context.shouldApplyBudgetTrim
     ) {
       return baseFetch(input, init);
     }
 
-    let parsedBody: Record<string, unknown> | undefined;
-    let rawBody =
-      typeof init?.body === "string"
-        ? init.body
-        : typeof (input as { body?: unknown } | undefined)?.body === "string"
-          ? ((input as { body?: string }).body as string)
-          : undefined;
-
-    // Some SDK/client paths pass a Request object with a streamed body instead of
-    // a plain init.body string. Clone and read it so wire-layer trimming/logging
-    // still works for those calls.
-    if (!rawBody && input instanceof Request) {
-      try {
-        const requestText = await input.clone().text();
-        rawBody = requestText.length > 0 ? requestText : undefined;
-      } catch {
-        rawBody = undefined;
-      }
-    }
-
-    if (rawBody) {
-      try {
-        parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
-      } catch {
-        parsedBody = undefined;
-      }
-    }
-
-    const promptCacheKey = normalizeProxyValue(parsedBody?.prompt_cache_key);
-    // Derive a stable hash from the first ~200 chars of the prompt when no
-    // prompt_cache_key is present — gives Claw Bay something sticky to route on.
-    let effectiveCacheKey = promptCacheKey;
-    if (!effectiveCacheKey && parsedBody) {
-      const inputPreview = Array.isArray(parsedBody[requestBodyKey])
-        ? JSON.stringify(parsedBody[requestBodyKey]).slice(0, 256)
-        : typeof parsedBody.instructions === "string"
-          ? parsedBody.instructions.slice(0, 256)
-          : "";
-      if (inputPreview) {
-        effectiveCacheKey = hashProxyValue(inputPreview).slice(0, 16);
-      }
-    }
-
-    // TODO(upstream-split): replaying previous_response_id is proxy-specific continuity
-    // glue. Keep this separate from the broadly portable prompt-trimming work.
-    const previousResponseId =
-      shouldApplyProxyContinuityExperiment &&
-      parsedBody &&
-      typeof parsedBody.previous_response_id !== "string"
-        ? getStoredProxyPreviousResponseId(effectiveCacheKey)
-        : undefined;
+    const rawBody = await extractRawRequestBody(input, init);
+    const parsedBody = parseProxyWireBody(rawBody);
+    const effectiveCacheKey = deriveClawBayEffectiveCacheKey(
+      parsedBody,
+      context.requestBodyKey,
+    );
+    const previousResponseId = getClawBayPreviousResponseId(
+      parsedBody,
+      effectiveCacheKey,
+      context.shouldApplyProxyContinuityExperiment,
+    );
     const proxyAffinityKey = effectiveCacheKey;
     const proxyAffinityHash = proxyAffinityKey
       ? hashProxyValue(proxyAffinityKey)
       : undefined;
+    applyClawBayRequestMutations(
+      parsedBody,
+      effectiveCacheKey,
+      previousResponseId,
+      context.shouldApplyProxyContinuityExperiment,
+    );
 
-    if (previousResponseId && parsedBody) {
-      parsedBody.previous_response_id = previousResponseId;
-    }
-
-    // Ensure prompt_cache_key is present on the wire — the Vercel AI SDK sets it
-    // via providerOptions, but we reinforce it here so Claw Bay always sees it.
-    if (shouldApplyProxyContinuityExperiment && parsedBody) {
-      if (typeof parsedBody.prompt_cache_key !== "string" && effectiveCacheKey) {
-        parsedBody.prompt_cache_key = effectiveCacheKey;
-      }
-      // Explicitly enable storage/caching — some proxies disable caching without it.
-      if (typeof parsedBody.store !== "boolean") {
-        parsedBody.store = true;
-      }
-    }
-
-    let inputItems = Array.isArray(parsedBody?.input)
-      ? (parsedBody.input as unknown[])
-      : Array.isArray(parsedBody?.messages)
-        ? (parsedBody.messages as unknown[])
-      : [];
-    let budgetTrimInfo:
-      | {
-          applied: boolean;
-          bodyTokensBefore: number;
-          bodyTokensAfter: number;
-          bodyCharsBefore: number;
-          bodyCharsAfter: number;
-          inputCountBefore: number;
-          inputCountAfter: number;
-          messagesDropped: number;
-          messagesTruncated: number;
-        }
-      | undefined;
-
-    // Hard cap on request size at the proxy wire layer — trims the request
-    // against the full serialized body (input + system prompt + tools +
-    // metadata), so the cap reflects what the proxy actually sees.
-    if (shouldApplyBudgetTrim && parsedBody && inputItems.length > 0) {
-      const effectiveWireBudget = env.LLM_CONTEXT_BUDGET;
-      const effectiveWireCharBudget = effectiveWireBudget * 4;
-      let serializedBody = JSON.stringify(parsedBody);
-      let bodyTokens = countTokens(serializedBody);
-      let bodyChars = serializedBody.length;
-      const bodyTokensBefore = bodyTokens;
-      const bodyCharsBefore = bodyChars;
-      const inputCountBefore = inputItems.length;
-      let messagesDropped = 0;
-      let messagesTruncated = 0;
-
-      if (
-        bodyTokens > effectiveWireBudget ||
-        bodyChars > effectiveWireCharBudget
-      ) {
-        let working = [...inputItems];
-        let lastLength = working.length;
-        let lastBodyTokens = bodyTokens;
-        let lastBodyChars = bodyChars;
-
-        while (
-          working.length > 0 &&
-          (bodyTokens > effectiveWireBudget || bodyChars > effectiveWireCharBudget)
-        ) {
-          const emptyInputTokens = countTokens(
-            JSON.stringify({ ...parsedBody, [requestBodyKey]: [] }),
-          );
-          const remainingInputBudget = Math.max(
-            effectiveWireBudget - emptyInputTokens,
-            0,
-          );
-          const result = trimMessagesToBudget(working, remainingInputBudget);
-
-          if (
-            result.droppedCount === 0 &&
-            result.truncatedCount === 0 &&
-            working.length === lastLength
-          ) {
-            break;
-          }
-
-          working = result.messages;
-          messagesDropped += result.droppedCount;
-          messagesTruncated += result.truncatedCount;
-          parsedBody[requestBodyKey] = working;
-          serializedBody = JSON.stringify(parsedBody);
-          bodyTokens = countTokens(serializedBody);
-          bodyChars = serializedBody.length;
-
-          if (
-            bodyTokens >= lastBodyTokens &&
-            bodyChars >= lastBodyChars &&
-            working.length === lastLength
-          ) {
-            break;
-          }
-
-          lastLength = working.length;
-          lastBodyTokens = bodyTokens;
-          lastBodyChars = bodyChars;
-        }
-
-        inputItems = working;
-      }
-
-      budgetTrimInfo = {
-        applied:
-          bodyTokensBefore > effectiveWireBudget ||
-          bodyCharsBefore > effectiveWireCharBudget,
-        bodyTokensBefore,
-        bodyTokensAfter: bodyTokens,
-        bodyCharsBefore,
-        bodyCharsAfter: bodyChars,
-        inputCountBefore,
-        inputCountAfter: inputItems.length,
-        messagesDropped,
-        messagesTruncated,
-      };
-
-      logger.info("Proxy wire request budget evaluation", {
-        requestType: isResponsesRequest ? "responses" : "chat_completions",
-        configuredBudget: env.LLM_CONTEXT_BUDGET,
-        effectiveWireBudget,
-        effectiveWireCharBudget,
-        bodyTokensBefore: budgetTrimInfo.bodyTokensBefore,
-        bodyTokensAfter: budgetTrimInfo.bodyTokensAfter,
-        bodyCharsBefore: budgetTrimInfo.bodyCharsBefore,
-        bodyCharsAfter: budgetTrimInfo.bodyCharsAfter,
-        messageArrayKey: requestBodyKey,
-        inputCountBefore: budgetTrimInfo.inputCountBefore,
-        inputCountAfter: budgetTrimInfo.inputCountAfter,
-        messagesDropped: budgetTrimInfo.messagesDropped,
-        messagesTruncated: budgetTrimInfo.messagesTruncated,
-        hasRawBody: !!rawBody,
-        bodyParseSucceeded: !!parsedBody,
-        model: parsedBody?.model,
-        trimmed: budgetTrimInfo.applied,
-      });
-
+    const trimResult = applyGenericWireBudgetTrim({
+      parsedBody,
+      inputItems: getRequestMessagesForTrim(parsedBody),
+      requestBodyKey: context.requestBodyKey,
+      shouldApplyBudgetTrim: context.shouldApplyBudgetTrim,
+    });
+    const inputItems = trimResult.inputItems;
+    const budgetTrimInfo = trimResult.budgetTrimInfo;
+    if (budgetTrimInfo) {
+      logProxyWireBudgetEvaluation(context, budgetTrimInfo, rawBody, parsedBody);
       if (budgetTrimInfo.applied) {
-        logger.info("Proxy wire request trimmed to token budget", {
-          requestType: isResponsesRequest ? "responses" : "chat_completions",
-          configuredBudget: env.LLM_CONTEXT_BUDGET,
-          effectiveWireBudget,
-          effectiveWireCharBudget,
-          bodyTokensBefore: budgetTrimInfo.bodyTokensBefore,
-          bodyTokensAfter: budgetTrimInfo.bodyTokensAfter,
-          bodyCharsBefore: budgetTrimInfo.bodyCharsBefore,
-          bodyCharsAfter: budgetTrimInfo.bodyCharsAfter,
-          messageArrayKey: requestBodyKey,
-          inputCountBefore: budgetTrimInfo.inputCountBefore,
-          inputCountAfter: budgetTrimInfo.inputCountAfter,
-          messagesDropped: budgetTrimInfo.messagesDropped,
-          messagesTruncated: budgetTrimInfo.messagesTruncated,
-          model: parsedBody?.model,
-        });
+        logProxyWireTrimmed(context, budgetTrimInfo, parsedBody);
       }
     }
 
     const serializedBody = JSON.stringify(parsedBody || {});
     const eventId = randomUUID();
+    const continuityHeaders = buildClawBayContinuityHeaders(
+      effectiveCacheKey,
+      context.shouldApplyProxyContinuityExperiment,
+    );
+    const categorySessionId =
+      continuityHeaders.session_id || getSessionIdForCacheKey(effectiveCacheKey);
 
-    // Build headers for sticky session routing on Claw Bay.
-    // For codex-native traffic: session_id header routes to the same backend.
-    // For OpenAI-compatible traffic: prompt_cache_key in the body handles routing.
-    // Use a category-specific session ID to prevent concurrent requests with
-    // different prompt_cache_keys from racing on the same backend.
-    const categorySessionId = getSessionIdForCacheKey(effectiveCacheKey);
-    const continuityHeaders: Record<string, string> =
-      shouldApplyProxyContinuityExperiment
-        ? {
-            session_id: categorySessionId,
-            "x-client-request-id": categorySessionId,
-          }
-        : {};
-
-    if (shouldLogRequest) {
+    if (context.shouldLogRequest) {
       logOpenAIWireEvent({
         event: "request",
         eventId,
         timestamp: new Date().toISOString(),
-        url,
-        method,
-        requestType: isResponsesRequest ? "responses" : "chat_completions",
+        url: context.url,
+        method: context.method,
+        requestType: context.requestType,
         hasRawBody: !!rawBody,
         bodyParseSucceeded: !!parsedBody,
         bodyHash: createHash("sha256").update(serializedBody).digest("hex"),
@@ -458,7 +672,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         reasoning: parsedBody?.reasoning,
         text: parsedBody?.text,
         include: parsedBody?.include,
-        messageArrayKey: requestBodyKey,
+        messageArrayKey: context.requestBodyKey,
         bodyCharsBeforeTrim: budgetTrimInfo?.bodyCharsBefore,
         bodyCharsAfterTrim: budgetTrimInfo?.bodyCharsAfter,
         inputCount: inputItems.length,
@@ -477,20 +691,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
       writeOpenAIWireBody(eventId, "request", serializedBody);
     }
 
-    // Merge headers safely — init.headers can be Headers, string[][], or Record.
-    const existingHeaders = init?.headers;
-    const mergedHeaders: Record<string, string> = {};
-    if (existingHeaders instanceof Headers) {
-      existingHeaders.forEach((v, k) => {
-        mergedHeaders[k] = v;
-      });
-    } else if (Array.isArray(existingHeaders)) {
-      for (const [k, v] of existingHeaders) {
-        mergedHeaders[k] = v;
-      }
-    } else if (existingHeaders && typeof existingHeaders === "object") {
-      Object.assign(mergedHeaders, existingHeaders);
-    }
+    const mergedHeaders = mergeRequestHeaders(init?.headers);
 
     const response = await baseFetch(
       input,
@@ -506,8 +707,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         : init,
     );
 
-    // Debug: log what headers were actually sent
-    if (shouldApplyProxyContinuityExperiment) {
+    if (context.shouldApplyProxyContinuityExperiment) {
       logOpenAIWireEvent({
         event: "headers-debug",
         eventId,
@@ -518,49 +718,28 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
           : "unchanged",
       });
     }
-    if (shouldApplyProxyContinuityExperiment) {
-      void response
-        .clone()
-        .text()
-        .then((body) => {
-          storeProxyPreviousResponseId(
-            effectiveCacheKey,
-            extractProxyResponseId(body),
-          );
-        })
-        .catch(() => {});
-    }
+    maybePersistClawBayPreviousResponseId(
+      response,
+      effectiveCacheKey,
+      context.shouldApplyProxyContinuityExperiment,
+    );
     let responseBody = "";
-    if (shouldLogRequest || env.LLM_LOG_OPENAI_WIRE_BODIES) {
+    if (context.shouldLogRequest || env.LLM_LOG_OPENAI_WIRE_BODIES) {
       try {
         responseBody = await response.clone().text();
       } catch {
         responseBody = "";
       }
     }
-    if (shouldLogRequest) {
-      const responseContentType = response.headers.get("content-type");
-      const responseBodyPreview =
-        responseBody.length > 0
-          ? responseBody.slice(0, 400)
-          : undefined;
-
-      logger.info("Proxy wire response summary", {
-        requestType: isResponsesRequest ? "responses" : "chat_completions",
-        status: response.status,
-        ok: response.ok,
-        contentType: responseContentType,
-        hasBody: responseBody.length > 0,
-        responseBodyChars: responseBody.length || 0,
-        responseBodyPreview,
-      });
+    if (context.shouldLogRequest) {
+      logProxyWireResponseSummary(context, response, responseBody);
 
       logOpenAIWireEvent({
         event: "response",
         eventId,
         timestamp: new Date().toISOString(),
-        url,
-        method,
+        url: context.url,
+        method: context.method,
         status: response.status,
         ok: response.ok,
       });
@@ -573,7 +752,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
 }
 
 // ---------------------------------------------------------------------------
-// buildProxyPromptCacheKey — overrides cache key for proxy continuity
+// Claw Bay prompt-cache / continuity option helpers
 // ---------------------------------------------------------------------------
 
 function buildProxyPromptCacheKey(
