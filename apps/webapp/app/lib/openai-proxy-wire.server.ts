@@ -3,6 +3,10 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { env } from "~/env.server";
 import {
+  shouldApplyContextBudget,
+  trimMessagesToBudget,
+} from "~/lib/context-budget.server";
+import {
   getStoredProxyPreviousResponseId,
   storeProxyPreviousResponseId,
 } from "~/lib/openai-proxy-turn-state.server";
@@ -222,9 +226,21 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
       }
     }
 
-    const inputItems = Array.isArray(parsedBody?.input)
+    let inputItems = Array.isArray(parsedBody?.input)
       ? (parsedBody.input as unknown[])
       : [];
+
+    // Hard cap on request size at the proxy wire layer — trims oldest messages
+    // when the input exceeds LLM_CONTEXT_BUDGET. Prevents the proxy from
+    // silently rejecting oversized requests (empty stream).
+    if (shouldApplyContextBudget() && parsedBody && inputItems.length > 0) {
+      const result = trimMessagesToBudget(inputItems, env.LLM_CONTEXT_BUDGET);
+      if (result.droppedCount > 0 || result.truncatedCount > 0) {
+        parsedBody.input = result.messages;
+        inputItems = result.messages;
+      }
+    }
+
     const serializedBody = JSON.stringify(parsedBody || {});
     const eventId = randomUUID();
 
