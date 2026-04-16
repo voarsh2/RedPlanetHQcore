@@ -5,7 +5,7 @@ import { env } from "~/env.server";
 // Token counting
 // ---------------------------------------------------------------------------
 
-function countTokens(text: string): number {
+export function countTokens(text: string): number {
   return encode(text).length;
 }
 
