@@ -95,11 +95,16 @@ function findLongestMessageIndex(messages: unknown[]): number {
   return maxIdx;
 }
 
+type TextAccessor = {
+  getText: () => string;
+  setText: (text: string) => void;
+};
+
 /**
- * Get a mutable reference to the first text part in a message.
+ * Get a mutable accessor for the first text part in a message.
  * Works with both UI-format and ModelMessage format.
  */
-function getFirstTextRef(message: unknown): { text: string } | null {
+function getFirstTextAccessor(message: unknown): TextAccessor | null {
   if (!message || typeof message !== "object") return null;
   const msg = message as Record<string, unknown>;
 
@@ -112,7 +117,13 @@ function getFirstTextRef(message: unknown): { text: string } | null {
         (part as { type?: string }).type === "text" &&
         typeof (part as { text?: string }).text === "string"
       ) {
-        return part as { text: string };
+        const textPart = part as { text: string };
+        return {
+          getText: () => textPart.text,
+          setText: (text: string) => {
+            textPart.text = text;
+          },
+        };
       }
     }
     return null;
@@ -122,8 +133,12 @@ function getFirstTextRef(message: unknown): { text: string } | null {
   if ("content" in msg) {
     const content = msg.content;
     if (typeof content === "string") {
-      // Wrap in a mutable object so caller can update it
-      return { text: content };
+      return {
+        getText: () => msg.content as string,
+        setText: (text: string) => {
+          msg.content = text;
+        },
+      };
     }
     if (Array.isArray(content)) {
       for (const part of content) {
@@ -133,7 +148,13 @@ function getFirstTextRef(message: unknown): { text: string } | null {
           (part as { type?: string }).type === "text" &&
           typeof (part as { text?: string }).text === "string"
         ) {
-          return part as { text: string };
+          const textPart = part as { text: string };
+          return {
+            getText: () => textPart.text,
+            setText: (text: string) => {
+              textPart.text = text;
+            },
+          };
         }
       }
     }
@@ -193,19 +214,21 @@ export function trimMessagesToBudget(
     const longestIdx = findLongestMessageIndex(working);
     if (longestIdx === -1) break;
 
-    const textRef = getFirstTextRef(working[longestIdx]);
-    if (!textRef) break;
+    const textAccessor = getFirstTextAccessor(working[longestIdx]);
+    if (!textAccessor) break;
 
     const suffixTokens = countTokens(TRUNCATION_SUFFIX);
     const currentTotal = totalTokens;
-    const withoutThisPart = currentTotal - countTokens(textRef.text);
+    const currentText = textAccessor.getText();
+    const withoutThisPart = currentTotal - countTokens(currentText);
     const availableTokens = budget - withoutThisPart;
     const maxTextTokens = Math.max(availableTokens - suffixTokens, 10);
 
-    textRef.text = truncateTextToTokenBudget(textRef.text, maxTextTokens);
-    if (!textRef.text.endsWith(TRUNCATION_SUFFIX.trim())) {
-      textRef.text += TRUNCATION_SUFFIX;
+    let nextText = truncateTextToTokenBudget(currentText, maxTextTokens);
+    if (!nextText.endsWith(TRUNCATION_SUFFIX.trim())) {
+      nextText += TRUNCATION_SUFFIX;
     }
+    textAccessor.setText(nextText);
 
     truncatedCount++;
     totalTokens = countTotalTokens(working);

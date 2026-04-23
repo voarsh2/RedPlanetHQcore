@@ -385,7 +385,7 @@ export async function makeModelCall(
 
   const { text, usage } = await generateText({
     model: modelInstance,
-    messages,
+    messages: trimmedMessages,
     ...generateTextOptions,
   });
 

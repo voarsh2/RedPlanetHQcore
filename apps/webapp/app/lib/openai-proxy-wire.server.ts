@@ -116,6 +116,7 @@ function logProxyWireResponseSummary(
   context: OpenAIWireRequestContext,
   response: Response,
   responseBody: string,
+  elapsedMs: number,
 ) {
   const responseContentType = response.headers.get("content-type");
   const responseBodyPreview =
@@ -129,7 +130,17 @@ function logProxyWireResponseSummary(
     hasBody: responseBody.length > 0,
     responseBodyChars: responseBody.length || 0,
     responseBodyPreview,
+    elapsedMs,
   });
+}
+
+function getRequestSignal(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): AbortSignal | undefined {
+  if (init?.signal) return init.signal;
+  if (input instanceof Request) return input.signal;
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -692,20 +703,62 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
     }
 
     const mergedHeaders = mergeRequestHeaders(init?.headers);
+    const existingSignal = getRequestSignal(input, init);
+    // TODO(upstream-split): proxy-only timeout is private-fork behavior to keep
+    // OpenAI-compatible backends from hanging forever. Keep this scoped to proxy
+    // mode unless we have upstream evidence that native OpenAI should share it.
+    const timeoutSignal = context.isProxyRequest
+      ? AbortSignal.timeout(env.OPENAI_PROXY_REQUEST_TIMEOUT_MS)
+      : undefined;
+    const combinedSignal =
+      existingSignal && timeoutSignal
+        ? AbortSignal.any([existingSignal, timeoutSignal])
+        : existingSignal || timeoutSignal;
+    const startedAt = Date.now();
 
-    const response = await baseFetch(
-      input,
-      previousResponseId || rawBody || Object.keys(continuityHeaders).length > 0
-        ? {
-            ...(init || {}),
-            body: serializedBody,
-            headers: {
-              ...mergedHeaders,
-              ...continuityHeaders,
+    let response: Response;
+    try {
+      response = await baseFetch(
+        input,
+        previousResponseId || rawBody || Object.keys(continuityHeaders).length > 0
+          ? {
+              ...(init || {}),
+              body: serializedBody,
+              headers: {
+                ...mergedHeaders,
+                ...continuityHeaders,
+              },
+              signal: combinedSignal,
+            }
+          : {
+              ...(init || {}),
+              signal: combinedSignal,
             },
-          }
-        : init,
-    );
+      );
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      const timedOut =
+        !!timeoutSignal &&
+        timeoutSignal.aborted &&
+        !(existingSignal?.aborted ?? false);
+
+      if (timedOut) {
+        logger.error("Proxy wire request timed out", {
+          requestType: context.requestType,
+          url: context.url,
+          method: context.method,
+          timeoutMs: env.OPENAI_PROXY_REQUEST_TIMEOUT_MS,
+          elapsedMs,
+          model: parsedBody?.model,
+          bodyChars: serializedBody.length,
+          messageArrayKey: context.requestBodyKey,
+          inputCount: inputItems.length,
+          proxyAffinityHash,
+        });
+      }
+
+      throw error;
+    }
 
     if (context.shouldApplyProxyContinuityExperiment) {
       logOpenAIWireEvent({
@@ -732,7 +785,12 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
       }
     }
     if (context.shouldLogRequest) {
-      logProxyWireResponseSummary(context, response, responseBody);
+      logProxyWireResponseSummary(
+        context,
+        response,
+        responseBody,
+        Date.now() - startedAt,
+      );
 
       logOpenAIWireEvent({
         event: "response",

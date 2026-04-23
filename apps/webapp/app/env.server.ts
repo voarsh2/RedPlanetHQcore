@@ -137,6 +137,11 @@ const EnvironmentSchema = z
       .default("false")
       .transform((val) => val === "true" || val === "1"),
     LLM_CONTEXT_BUDGET: z.coerce.number().int().positive().optional(),
+    OPENAI_PROXY_REQUEST_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(300000),
     OPENAI_PROXY_FORCE_RESPONSES: z
       .string()
       .optional()
