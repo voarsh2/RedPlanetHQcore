@@ -806,6 +806,14 @@ async function resolveStatementsWithDuplicates(
   }
 
   if (similarStatements.length > 0) {
+    logger.info("Prepared statement resolution context", {
+      episodeUuid: episode.uuid,
+      newStatementsCount: newStatements.length,
+      similarStatementsCount: similarStatements.length,
+      uniqueCandidateStatementCount: allStatementIdsToFetch.size,
+      episodeContentChars: episode.content.length,
+    });
+
     const promptContext = {
       newStatements,
       similarStatements,
@@ -831,6 +839,10 @@ async function resolveStatementsWithDuplicates(
       undefined,
       "low",
       "statement-resolution",
+      undefined,
+      {
+        callSite: "graph-resolution:statement-resolution",
+      },
     );
 
     try {

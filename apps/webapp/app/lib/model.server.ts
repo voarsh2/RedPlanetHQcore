@@ -211,6 +211,15 @@ interface PromptDiagnostics {
   messageCount: number;
 }
 
+type ProxySdkTimeoutOptions = {
+  enabled: boolean;
+  operation: string;
+  model: string;
+  cacheKey?: string;
+  telemetry?: ModelCallTelemetry;
+  promptDiagnostics: PromptDiagnostics;
+};
+
 function serializeMessageContent(content: ModelMessage["content"]): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -272,6 +281,57 @@ function logPromptDiagnostics(
   });
 }
 
+function shouldApplyProxySdkTimeout(
+  model: string,
+  useOllamaForChat: boolean,
+): boolean {
+  if (!env.OPENAI_BASE_URL || useOllamaForChat) return false;
+  if (model.includes("claude") || model.includes("gemini")) return false;
+  return true;
+}
+
+async function withProxySdkTimeout<T>(
+  options: ProxySdkTimeoutOptions,
+  run: () => Promise<T>,
+): Promise<T> {
+  if (!options.enabled) {
+    return run();
+  }
+
+  const startedAt = Date.now();
+
+  return await new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      logger.error("Proxy SDK call timed out", {
+        operation: options.operation,
+        model: options.model,
+        cacheKey: options.cacheKey,
+        callSite: options.telemetry?.callSite,
+        promptChars: options.promptDiagnostics.promptChars,
+        messageCount: options.promptDiagnostics.messageCount,
+        timeoutMs: env.OPENAI_PROXY_REQUEST_TIMEOUT_MS,
+        elapsedMs: Date.now() - startedAt,
+      });
+      reject(
+        new Error(
+          `Proxy SDK call timed out after ${env.OPENAI_PROXY_REQUEST_TIMEOUT_MS}ms`,
+        ),
+      );
+    }, env.OPENAI_PROXY_REQUEST_TIMEOUT_MS);
+
+    run().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export async function makeModelCall(
   stream: boolean,
   messages: ModelMessage[],
@@ -287,7 +347,7 @@ export async function makeModelCall(
 
   const modelInstance = getModel(model);
   const generateTextOptions: any = {};
-  const promptDiagnostics = buildPromptDiagnostics(messages);
+  const originalPromptDiagnostics = buildPromptDiagnostics(messages);
 
   const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
   const openaiApiMode = getEffectiveOpenAIApiMode(model);
@@ -309,20 +369,6 @@ export async function makeModelCall(
     throw new Error(`Unsupported model type: ${model}`);
   }
 
-  logPromptDiagnostics(
-    "request",
-    model,
-    complexity,
-    promptDiagnostics,
-    telemetry,
-    {
-      cacheKey,
-      promptCacheConfigured: promptCacheOptions.promptCacheConfigured,
-      promptCacheStrategy: promptCacheOptions.promptCacheStrategy,
-      stream,
-    },
-  );
-
   // Token budget guard (env-gated safety net for models with smaller context windows)
   let trimmedMessages = messages;
   if (shouldApplyContextBudget()) {
@@ -342,6 +388,33 @@ export async function makeModelCall(
       });
     }
   }
+
+  const promptDiagnostics =
+    trimmedMessages === messages
+      ? originalPromptDiagnostics
+      : buildPromptDiagnostics(trimmedMessages);
+
+  logPromptDiagnostics(
+    "request",
+    model,
+    complexity,
+    promptDiagnostics,
+    telemetry,
+    {
+      cacheKey,
+      promptCacheConfigured: promptCacheOptions.promptCacheConfigured,
+      promptCacheStrategy: promptCacheOptions.promptCacheStrategy,
+      stream,
+      originalPromptChars:
+        originalPromptDiagnostics.promptChars !== promptDiagnostics.promptChars
+          ? originalPromptDiagnostics.promptChars
+          : undefined,
+      originalMessageCount:
+        originalPromptDiagnostics.messageCount !== promptDiagnostics.messageCount
+          ? originalPromptDiagnostics.messageCount
+          : undefined,
+    },
+  );
 
   if (stream) {
     return streamText({
@@ -383,11 +456,22 @@ export async function makeModelCall(
     });
   }
 
-  const { text, usage } = await generateText({
-    model: modelInstance,
-    messages: trimmedMessages,
-    ...generateTextOptions,
-  });
+  const { text, usage } = await withProxySdkTimeout(
+    {
+      enabled: shouldApplyProxySdkTimeout(model, useOllamaForChat),
+      operation: "generateText",
+      model,
+      cacheKey,
+      telemetry,
+      promptDiagnostics,
+    },
+    () =>
+      generateText({
+        model: modelInstance,
+        messages: trimmedMessages,
+        ...generateTextOptions,
+      }),
+  );
 
   const tokenUsage = usage
     ? {

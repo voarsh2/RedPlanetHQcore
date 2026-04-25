@@ -169,15 +169,39 @@ function getFirstTextAccessor(message: unknown): TextAccessor | null {
  * which is safer than going over budget.
  */
 function truncateTextToTokenBudget(text: string, maxTokens: number): string {
-  const charBudget = Math.max(maxTokens * 4, 100);
-  if (text.length <= charBudget) return text;
+  if (countTokens(text) <= maxTokens) return text;
 
-  let truncated = text.slice(0, charBudget);
-  const lastSpace = truncated.lastIndexOf(" ");
-  if (lastSpace > charBudget * 0.8) {
-    truncated = truncated.slice(0, lastSpace);
+  let low = 0;
+  let high = text.length;
+  let best = "";
+
+  // Binary search the longest prefix that actually fits the token budget.
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = text.slice(0, mid);
+    const tokens = countTokens(candidate);
+
+    if (tokens <= maxTokens) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
   }
-  return truncated;
+
+  if (!best) {
+    return text.slice(0, Math.max(1, Math.floor(text.length / 2)));
+  }
+
+  const lastSpace = best.lastIndexOf(" ");
+  if (lastSpace > best.length * 0.8) {
+    const spaceTrimmed = best.slice(0, lastSpace);
+    if (countTokens(spaceTrimmed) <= maxTokens) {
+      return spaceTrimmed;
+    }
+  }
+
+  return best;
 }
 
 // ---------------------------------------------------------------------------
