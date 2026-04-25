@@ -20,7 +20,6 @@ import { env } from "~/env.server";
 import {
   buildOpenAIWireFetch,
   buildOpenAIPromptCacheOptions,
-  type OpenAIApiMode,
 } from "~/lib/openai-proxy-wire.server";
 import {
   shouldApplyContextBudget,
@@ -90,7 +89,10 @@ export function getModelForBatch(): string {
   return batchDowngrades[baseModel] || baseModel;
 }
 
-export const getModel = (takeModel?: string) => {
+export const getModel = (
+  takeModel?: string,
+  openaiApiModeOverride?: OpenAIApiMode,
+) => {
   let model = takeModel;
 
   const anthropicKey = env.ANTHROPIC_API_KEY;
@@ -100,7 +102,8 @@ export const getModel = (takeModel?: string) => {
   const ollamaUrl = env.OLLAMA_URL;
   const chatProvider = env.CHAT_PROVIDER;
   model = model || env.MODEL;
-  const openaiApiMode = getEffectiveOpenAIApiMode(model);
+  const openaiApiMode =
+    openaiApiModeOverride || getEffectiveOpenAIApiMode(model);
 
   let modelInstance;
   let modelTemperature = env.MODEL_TEMPERATURE;
@@ -190,6 +193,25 @@ export function getEffectiveOpenAIApiMode(model?: string): OpenAIApiMode {
   return shouldForceProxyResponsesForModel(model)
     ? "responses"
     : getConfiguredOpenAIApiMode();
+}
+
+function hasModelCallTools(options?: any): boolean {
+  if (!options?.tools || typeof options.tools !== "object") return false;
+  return Object.keys(options.tools).length > 0;
+}
+
+function shouldUseChatCompletionsForProxyTools(params: {
+  model: string;
+  options?: any;
+  configuredOpenaiApiMode: OpenAIApiMode;
+  effectiveOpenaiApiMode: OpenAIApiMode;
+  useOllamaForChat: boolean;
+}): boolean {
+  if (!env.OPENAI_BASE_URL || params.useOllamaForChat) return false;
+  if (params.configuredOpenaiApiMode !== "chat_completions") return false;
+  if (params.effectiveOpenaiApiMode !== "responses") return false;
+  if (!params.model.includes("gpt")) return false;
+  return hasModelCallTools(params.options);
 }
 
 export interface ModelCallTelemetry {
@@ -345,13 +367,33 @@ export async function makeModelCall(
   let model = getModelForTask(complexity);
   logger.info(`complexity: ${complexity}, model: ${model}`);
 
-  const modelInstance = getModel(model);
   const generateTextOptions: any = {};
   const originalPromptDiagnostics = buildPromptDiagnostics(messages);
 
   const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
-  const openaiApiMode = getEffectiveOpenAIApiMode(model);
   const useOllamaForChat = env.CHAT_PROVIDER === "ollama";
+  let openaiApiMode = getEffectiveOpenAIApiMode(model);
+  const forceChatCompletionsForProxyTools =
+    shouldUseChatCompletionsForProxyTools({
+      model,
+      options,
+      configuredOpenaiApiMode,
+      effectiveOpenaiApiMode: openaiApiMode,
+      useOllamaForChat,
+    });
+
+  if (forceChatCompletionsForProxyTools) {
+    openaiApiMode = "chat_completions";
+    logger.info("Proxy forced Responses disabled for tool call", {
+      model,
+      complexity,
+      callSite: telemetry?.callSite,
+      cacheKey,
+      toolCount: Object.keys(options?.tools || {}).length,
+    });
+  }
+
+  const modelInstance = getModel(model, openaiApiMode);
   const promptCacheOptions = buildOpenAIPromptCacheOptions({
     model,
     cacheKey: cacheKey || `ingestion-${complexity}`,

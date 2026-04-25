@@ -202,8 +202,12 @@ function extractProxyResponseId(body: string): string | undefined {
     try {
       const parsed = JSON.parse(trimmed) as {
         id?: unknown;
-        response?: { id?: unknown };
+        status?: unknown;
+        response?: { id?: unknown; status?: unknown };
       };
+      if (parsed.status === "failed" || parsed.response?.status === "failed") {
+        return undefined;
+      }
       return normalizeProxyValue(parsed.id ?? parsed.response?.id);
     } catch {
       return undefined;
@@ -214,8 +218,9 @@ function extractProxyResponseId(body: string): string | undefined {
     if (!line.startsWith("data: ")) continue;
     try {
       const parsed = JSON.parse(line.slice(6)) as {
-        response?: { id?: unknown };
+        response?: { id?: unknown; status?: unknown };
       };
+      if (parsed.response?.status === "failed") continue;
       const id = normalizeProxyValue(parsed.response?.id);
       if (id) return id;
     } catch {
