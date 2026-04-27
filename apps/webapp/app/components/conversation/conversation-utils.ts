@@ -39,6 +39,9 @@ export const getToolDisplayName = (toolType: string): string => {
  */
 const getNestedParts = (output: any): any[] => {
   if (!output) return [];
+  if (Array.isArray(output)) {
+    return output;
+  }
   // Check output.parts first (sub-agent response structure)
   if (output.parts && Array.isArray(output.parts)) {
     return output.parts;

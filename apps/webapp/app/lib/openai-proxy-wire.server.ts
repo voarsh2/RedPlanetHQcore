@@ -117,6 +117,7 @@ function logProxyWireResponseSummary(
   response: Response,
   responseBody: string,
   elapsedMs: number,
+  responseBodySkippedReason?: string,
 ) {
   const responseContentType = response.headers.get("content-type");
   const responseBodyPreview =
@@ -130,8 +131,14 @@ function logProxyWireResponseSummary(
     hasBody: responseBody.length > 0,
     responseBodyChars: responseBody.length || 0,
     responseBodyPreview,
+    responseBodySkippedReason,
     elapsedMs,
   });
+}
+
+function isStreamingResponse(response: Response): boolean {
+  const contentType = response.headers.get("content-type") || "";
+  return contentType.toLowerCase().includes("text/event-stream");
 }
 
 function getRequestSignal(
@@ -782,7 +789,13 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
       context.shouldApplyProxyContinuityExperiment,
     );
     let responseBody = "";
-    if (context.shouldLogRequest || env.LLM_LOG_OPENAI_WIRE_BODIES) {
+    const responseBodySkippedReason = isStreamingResponse(response)
+      ? "streaming-response"
+      : undefined;
+    if (
+      !responseBodySkippedReason &&
+      (context.shouldLogRequest || env.LLM_LOG_OPENAI_WIRE_BODIES)
+    ) {
       try {
         responseBody = await response.clone().text();
       } catch {
@@ -795,6 +808,7 @@ export function buildOpenAIWireFetch(baseFetch: typeof fetch): typeof fetch {
         response,
         responseBody,
         Date.now() - startedAt,
+        responseBodySkippedReason,
       );
 
       logOpenAIWireEvent({

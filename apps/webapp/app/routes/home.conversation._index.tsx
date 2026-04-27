@@ -19,6 +19,7 @@ import {
 
 import { PageHeader } from "~/components/common/page-header";
 import { HistoryDropdown } from "~/components/conversation/history-dropdown";
+import { ClientOnly } from "remix-utils/client-only";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   // Only return userId, not the heavy nodeLinks
@@ -70,7 +71,9 @@ export default function Chat() {
   return (
     <>
       <PageHeader title="Conversation" actionsNode={<HistoryDropdown />} />
-      {typeof window !== "undefined" && <ConversationNew user={user} />}
+      <ClientOnly fallback={null}>
+        {() => <ConversationNew user={user} />}
+      </ClientOnly>
     </>
   );
 }

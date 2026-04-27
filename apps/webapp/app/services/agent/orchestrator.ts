@@ -3,8 +3,6 @@ import {
   type LanguageModel,
   stepCountIs,
   tool,
-  readUIMessageStream,
-  type UIMessage,
 } from "ai";
 import { z } from "zod";
 
@@ -16,30 +14,11 @@ import { makeModelCall } from "~/lib/model.server";
 import { getGatewayAgents, runGatewayExplorer } from "./gateway";
 import { type SkillRef } from "./types";
 import { prisma } from "~/db.server";
-
-/**
- * Recursively checks if a message contains any tool part with state "approval-requested"
- */
-const hasApprovalRequested = (message: UIMessage): boolean => {
-  const checkParts = (parts: any[]): boolean => {
-    for (const part of parts) {
-      if (part.state === "approval-requested") {
-        return true;
-      }
-      // Check nested output.parts (sub-agent responses)
-      if (part.output?.parts && Array.isArray(part.output.parts)) {
-        if (checkParts(part.output.parts)) return true;
-      }
-      // Check nested output.content
-      if (part.output?.content && Array.isArray(part.output.content)) {
-        if (checkParts(part.output.content)) return true;
-      }
-    }
-    return false;
-  };
-
-  return message.parts ? checkParts(message.parts) : false;
-};
+import {
+  compactNestedResult,
+  type ToolProgressSink,
+  withProgressHeartbeat,
+} from "./tool-progress";
 
 export type OrchestratorMode = "read" | "write";
 
@@ -218,6 +197,7 @@ ${skillsSection ? skillsSection.trim() : ""}
 export interface OrchestratorResult {
   stream: ReturnType<typeof streamText>;
   startTime: number;
+  progressId?: string;
 }
 
 export async function runOrchestrator(
@@ -230,8 +210,11 @@ export async function runOrchestrator(
   abortSignal?: AbortSignal,
   userPersona?: string,
   skills?: SkillRef[],
+  progressSink?: ToolProgressSink,
+  progressParentId?: string,
 ): Promise<OrchestratorResult> {
   const startTime = Date.now();
+  const orchestratorProgressId = `orchestrator:${crypto.randomUUID()}`;
 
   // Get user's connected integrations
   const connectedIntegrations =
@@ -259,6 +242,15 @@ export async function runOrchestrator(
   logger.info(
     `Orchestrator: Loaded ${connectedIntegrations.length} integrations, ${gateways.length} gateways, mode: ${mode}`,
   );
+  await progressSink?.({
+    id: orchestratorProgressId,
+    parentId: progressParentId,
+    level: 1,
+    label: "Orchestrator",
+    status: "running",
+    detail: mode === "read" ? "Choosing context sources" : "Choosing action path",
+    elapsedMs: 0,
+  });
 
   // Build tools based on mode
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -276,18 +268,62 @@ export async function runOrchestrator(
         ),
     }),
     execute: async ({ query }) => {
+      const toolRunId = crypto.randomUUID();
+      const progressId = `memory-search:${toolRunId}`;
+      const startedAt = Date.now();
       logger.info(`Orchestrator: memory search - ${query}`);
+      await progressSink?.({
+        id: progressId,
+        parentId: orchestratorProgressId,
+        level: 2,
+        label: "Memory explorer",
+        status: "running",
+        detail: query,
+        elapsedMs: 0,
+      });
       try {
-        const result = await searchMemoryWithAgent(
-          query,
-          userId,
-          workspaceId,
-          source,
-          { structured: false },
+        const result = await withProgressHeartbeat(
+          searchMemoryWithAgent(
+            query,
+            userId,
+            workspaceId,
+            source,
+            { structured: false },
+          ),
+          {
+            sink: progressSink,
+            event: {
+              id: progressId,
+              parentId: orchestratorProgressId,
+              level: 2,
+              label: "Memory explorer",
+              detail: "Memory search still running",
+            },
+            startedAt,
+            intervalMs: 10_000,
+          },
         );
+        await progressSink?.({
+          id: progressId,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: "Memory explorer",
+          status: "completed",
+          detail: result ? "Memory search completed" : "No memory results found",
+          elapsedMs: Date.now() - startedAt,
+        });
         return result || "nothing found";
       } catch (error: any) {
         logger.warn("Memory search failed", error);
+        await progressSink?.({
+          id: progressId,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: "Memory explorer",
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+          elapsedMs: Date.now() - startedAt,
+        });
         return "nothing found";
       }
     },
@@ -337,9 +373,21 @@ export async function runOrchestrator(
         query: z.string().describe("What data to get"),
       }),
       execute: async function* ({ integration, query }, { abortSignal }) {
+        const toolRunId = crypto.randomUUID();
+        const progressId = `integration-query:${toolRunId}`;
+        const startedAt = Date.now();
         logger.info(
           `Orchestrator: integration query - ${integration}: ${query}`,
         );
+        await progressSink?.({
+          id: progressId,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: `${integration} explorer`,
+          status: "running",
+          detail: query,
+          elapsedMs: 0,
+        });
 
         const { stream, hasIntegrations } = await runIntegrationExplorer(
           `${query} from ${integration}`,
@@ -349,32 +397,76 @@ export async function runOrchestrator(
           source,
           userId,
           abortSignal,
+          progressSink,
+          progressId,
         );
+        logger.info("Orchestrator: integration_query nested stream created", {
+          toolRunId,
+          elapsedMs: Date.now() - startedAt,
+          integration,
+          queryChars: query.length,
+          hasIntegrations,
+        });
 
         if (!hasIntegrations) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} explorer`,
+            status: "failed",
+            detail: "No integrations connected",
+            elapsedMs: Date.now() - startedAt,
+          });
           yield {
             parts: [{ type: "text", text: "No integrations connected" }],
           };
+          logger.info("Orchestrator: integration_query skipped no integrations", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+          });
           return;
         }
 
-        // Stream the integration explorer's work
-        let approvalRequested = false;
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          if (approvalRequested) {
-            continue;
-          }
-
-          yield message;
-
-          if (hasApprovalRequested(message)) {
-            logger.info(
-              `Orchestrator: Stopping integration_query - approval requested`,
-            );
-            approvalRequested = true;
-          }
+        try {
+          const finalText = await stream.text;
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} explorer`,
+            status: "completed",
+            detail: "Integration query complete",
+            elapsedMs: Date.now() - startedAt,
+          });
+          yield compactNestedResult(
+            finalText,
+            `Integration query for ${integration} completed, but no final summary was produced.`,
+          );
+          logger.info("Orchestrator: integration_query nested stream closed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+            finalTextChars: finalText?.length ?? 0,
+          });
+        } catch (error) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} explorer`,
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+            elapsedMs: Date.now() - startedAt,
+          });
+          logger.error("Orchestrator: integration_query nested stream failed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+            error,
+          });
+          throw error;
         }
       },
     });
@@ -388,8 +480,28 @@ export async function runOrchestrator(
           .describe("What to search for - be specific and clear"),
       }),
       execute: async ({ query }) => {
+        const toolRunId = crypto.randomUUID();
+        const startedAt = Date.now();
         logger.info(`Orchestrator: web search - ${query}`);
+        await progressSink?.({
+          id: `web-search:${toolRunId}`,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: "Web search",
+          status: "running",
+          detail: query,
+          elapsedMs: 0,
+        });
         const result = await runWebExplorer(query, timezone);
+        await progressSink?.({
+          id: `web-search:${toolRunId}`,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: "Web search",
+          status: result.success ? "completed" : "failed",
+          detail: result.success ? "Web search completed" : "Web search unavailable",
+          elapsedMs: Date.now() - startedAt,
+        });
         return result.success ? result.data : "web search unavailable";
       },
     });
@@ -407,9 +519,21 @@ export async function runOrchestrator(
         action: z.string().describe("What action to perform, be specific"),
       }),
       execute: async function* ({ integration, action }, { abortSignal }) {
+        const toolRunId = crypto.randomUUID();
+        const progressId = `integration-action:${toolRunId}`;
+        const startedAt = Date.now();
         logger.info(
           `Orchestrator: integration action - ${integration}: ${action}`,
         );
+        await progressSink?.({
+          id: progressId,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: `${integration} action`,
+          status: "running",
+          detail: action,
+          elapsedMs: 0,
+        });
 
         const { stream, hasIntegrations } = await runIntegrationExplorer(
           `${action} on ${integration}`,
@@ -419,32 +543,76 @@ export async function runOrchestrator(
           source,
           userId,
           abortSignal,
+          progressSink,
+          progressId,
         );
+        logger.info("Orchestrator: integration_action nested stream created", {
+          toolRunId,
+          elapsedMs: Date.now() - startedAt,
+          integration,
+          actionChars: action.length,
+          hasIntegrations,
+        });
 
         if (!hasIntegrations) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} action`,
+            status: "failed",
+            detail: "No integrations connected",
+            elapsedMs: Date.now() - startedAt,
+          });
           yield {
             parts: [{ type: "text", text: "No integrations connected" }],
           };
+          logger.info("Orchestrator: integration_action skipped no integrations", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+          });
           return;
         }
 
-        // Stream the integration explorer's work
-        let approvalRequested = false;
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          if (approvalRequested) {
-            continue;
-          }
-
-          yield message;
-
-          if (hasApprovalRequested(message)) {
-            logger.info(
-              `Orchestrator: Stopping integration_action - approval requested`,
-            );
-            approvalRequested = true;
-          }
+        try {
+          const finalText = await stream.text;
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} action`,
+            status: "completed",
+            detail: "Integration action complete",
+            elapsedMs: Date.now() - startedAt,
+          });
+          yield compactNestedResult(
+            finalText,
+            `Integration action for ${integration} completed, but no final summary was produced.`,
+          );
+          logger.info("Orchestrator: integration_action nested stream closed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+            finalTextChars: finalText?.length ?? 0,
+          });
+        } catch (error) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `${integration} action`,
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+            elapsedMs: Date.now() - startedAt,
+          });
+          logger.error("Orchestrator: integration_action nested stream failed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            integration,
+            error,
+          });
+          throw error;
         }
       },
     });
@@ -466,15 +634,46 @@ export async function runOrchestrator(
           ),
       }),
       execute: async function* ({ intent }, { abortSignal }) {
+        const toolRunId = crypto.randomUUID();
+        const progressId = `gateway:${toolRunId}`;
+        const startedAt = Date.now();
         logger.info(`Orchestrator: Gateway ${gateway.name} - ${intent}`);
+        await progressSink?.({
+          id: progressId,
+          parentId: orchestratorProgressId,
+          level: 2,
+          label: `Gateway: ${gateway.name}`,
+          status: "running",
+          detail: intent,
+          elapsedMs: 0,
+        });
 
         const { stream, gatewayConnected } = await runGatewayExplorer(
           gateway.id,
           intent,
           abortSignal,
+          progressSink,
+          progressId,
         );
+        logger.info("Orchestrator: gateway nested stream created", {
+          toolRunId,
+          elapsedMs: Date.now() - startedAt,
+          gatewayName: gateway.name,
+          intentChars: intent.length,
+          gatewayConnected,
+          hasStream: Boolean(stream),
+        });
 
         if (!gatewayConnected || !stream) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `Gateway: ${gateway.name}`,
+            status: "failed",
+            detail: "Gateway is not connected",
+            elapsedMs: Date.now() - startedAt,
+          });
           yield {
             parts: [
               {
@@ -483,25 +682,52 @@ export async function runOrchestrator(
               },
             ],
           };
+          logger.info("Orchestrator: gateway skipped not connected", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            gatewayName: gateway.name,
+          });
           return;
         }
 
-        let approvalRequested = false;
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          if (approvalRequested) {
-            continue;
-          }
-
-          yield message;
-
-          if (hasApprovalRequested(message)) {
-            logger.info(
-              `Orchestrator: Stopping gateway ${gateway.name} - approval requested`,
-            );
-            approvalRequested = true;
-          }
+        try {
+          const finalText = await stream.text;
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `Gateway: ${gateway.name}`,
+            status: "completed",
+            detail: "Gateway task complete",
+            elapsedMs: Date.now() - startedAt,
+          });
+          yield compactNestedResult(
+            finalText,
+            `Gateway "${gateway.name}" completed, but no final summary was produced.`,
+          );
+          logger.info("Orchestrator: gateway nested stream closed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            gatewayName: gateway.name,
+            finalTextChars: finalText?.length ?? 0,
+          });
+        } catch (error) {
+          await progressSink?.({
+            id: progressId,
+            parentId: orchestratorProgressId,
+            level: 2,
+            label: `Gateway: ${gateway.name}`,
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+            elapsedMs: Date.now() - startedAt,
+          });
+          logger.error("Orchestrator: gateway nested stream failed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            gatewayName: gateway.name,
+            error,
+          });
+          throw error;
         }
       },
     });
@@ -539,5 +765,6 @@ export async function runOrchestrator(
   return {
     stream,
     startTime,
+    progressId: progressSink ? orchestratorProgressId : undefined,
   };
 }

@@ -16,9 +16,22 @@ import {
 } from "../ui/collapsible";
 import StaticLogo from "../logo/logo";
 import { Button } from "../ui";
-import { ArrowDown, ArrowRight, ChevronDown, ChevronRight, LoaderCircle, TriangleAlert } from "lucide-react";
+import {
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  LoaderCircle,
+  TriangleAlert,
+} from "lucide-react";
 import { ApprovalComponent } from "./approval-component";
-import { findAllToolsDeep, findFirstPendingApprovalIndex, isToolDisabled, hasNeedsApprovalDeep, getToolDisplayName } from "./conversation-utils";
+import {
+  findAllToolsDeep,
+  findFirstPendingApprovalIndex,
+  isToolDisabled,
+  hasNeedsApprovalDeep,
+  getToolDisplayName,
+} from "./conversation-utils";
 
 interface AIConversationItemProps {
   message: UIMessage;
@@ -39,6 +52,22 @@ const getNestedPartsFromOutput = (output: any): any[] => {
   return [];
 };
 
+const getCompactOutputContent = (output: any) => {
+  if (Array.isArray(output?.parts)) {
+    const text = output.parts
+      .map((part: any) => part?.text)
+      .filter(Boolean)
+      .join("\n");
+
+    if (text) return text;
+  }
+
+  if (output?.content) return output.content;
+  if (typeof output === "string") return output;
+
+  return undefined;
+};
+
 const Tool = ({
   part,
   addToolApprovalResponse,
@@ -55,31 +84,38 @@ const Tool = ({
   isNested?: boolean;
 }) => {
   const needsApproval = part.state === "approval-requested";
+  const output = (part as any).output;
+  const progressItems = Array.isArray(output?.progress) ? output.progress : [];
 
   // Get all nested parts from output (handles both .parts and .content)
-  const allNestedParts = getNestedPartsFromOutput((part as any).output);
+  const allNestedParts = getNestedPartsFromOutput(output);
 
   // Filter to get only tool parts
   const nestedToolParts = allNestedParts.filter(
-    (item: any) => item.type?.includes("tool-")
+    (item: any) => item.type?.includes("tool-"),
   );
   const hasNestedTools = nestedToolParts.length > 0;
 
   // Check if any nested tool (at any depth) needs approval (to auto-open)
-  const hasNestedApproval = hasNestedTools && hasNeedsApprovalDeep(nestedToolParts);
+  const hasNestedApproval =
+    hasNestedTools && hasNeedsApprovalDeep(nestedToolParts);
 
   const [isOpen, setIsOpen] = useState(needsApproval || hasNestedApproval);
 
   // Extract text parts from output (non-tool content)
   const textParts = allNestedParts.filter(
-    (item: any) => !item.type?.includes("tool-") && (item.text || item.type === "text")
+    (item: any) =>
+      !item.type?.includes("tool-") && (item.text || item.type === "text"),
   );
   const textPart = textParts.map((t: any) => t.text).filter(Boolean).join("\n");
 
   const handleApprove = () => {
 
     if (addToolApprovalResponse && (part as any)?.approval?.id && !isDisabled) {
-      addToolApprovalResponse({ id: (part as any)?.approval?.id, approved: true });
+      addToolApprovalResponse({
+        id: (part as any)?.approval?.id,
+        approved: true,
+      });
       setIsOpen(false);
     }
   };
@@ -87,7 +123,10 @@ const Tool = ({
   const handleReject = () => {
 
     if (addToolApprovalResponse && (part as any)?.approval?.id && !isDisabled) {
-      addToolApprovalResponse({ id: (part as any)?.approval?.id, approved: false });
+      addToolApprovalResponse({
+        id: (part as any)?.approval?.id,
+        approved: false,
+      });
       setIsOpen(false);
     }
   };
@@ -135,18 +174,31 @@ const Tool = ({
       );
     }
 
-    // Show JSON output for leaf tools
-    const output = (part as any).output;
-    const outputContent = output?.content || output;
+    if (part.state !== "output-available") {
+      return <ToolProgress progressItems={progressItems} isRunning />;
+    }
+
+    if (!output) {
+      return null;
+    }
+
+    const outputContent = getCompactOutputContent(output);
 
     return (
       <div className="py-1">
-        <p className="text-muted-foreground mb-1 text-xs font-medium">Result</p>
-        <pre className="bg-grayAlpha-50 max-h-[200px] overflow-auto rounded p-2 font-mono text-xs text-[#BF4594]">
-          {typeof outputContent === "string"
-            ? outputContent
-            : JSON.stringify(outputContent, null, 2)}
-        </pre>
+        <ToolProgress progressItems={progressItems} />
+        {outputContent && (
+          <>
+            <p className="text-muted-foreground mb-1 text-xs font-medium">
+              Result
+            </p>
+            <pre className="bg-grayAlpha-50 max-h-[200px] overflow-auto rounded p-2 font-mono text-xs text-[#BF4594]">
+              {typeof outputContent === "string"
+                ? outputContent
+                : JSON.stringify(outputContent, null, 2)}
+            </pre>
+          </>
+        )}
       </div>
     );
   };
@@ -199,14 +251,65 @@ const Tool = ({
           disabled={isDisabled}
         >
           {getIcon()}
-          <span >{displayName}</span>
-          <span className="text-muted-foreground">{isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
+          <span>{displayName}</span>
+          <span className="text-muted-foreground">
+            {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </span>
         </button>
       </CollapsibleTrigger>
       <CollapsibleContent className={cn("w-full", isNested && "pl-6")}>
         {hasNestedTools ? renderNestedContent() : renderLeafContent()}
       </CollapsibleContent>
     </Collapsible>
+  );
+};
+
+const ToolProgress = ({
+  progressItems,
+  isRunning = false,
+}: {
+  progressItems: any[];
+  isRunning?: boolean;
+}) => {
+  if (!progressItems.length) {
+    return (
+      <div className="text-muted-foreground py-1 text-sm">
+        {isRunning ? "Running..." : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-1 py-1">
+      {progressItems.map((item, index) => {
+        const status = item.status ?? "running";
+        const isItemRunning = status === "running";
+        const isFailed = status === "failed";
+        const level = Math.max(0, Math.min(Number(item.level ?? 0), 4));
+
+        return (
+          <div
+            key={item.id ?? index}
+            className="text-muted-foreground flex items-start gap-2 text-sm"
+            style={{ paddingLeft: `${level * 16}px` }}
+          >
+            {isItemRunning ? (
+              <LoaderCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+            ) : isFailed ? (
+              <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" />
+            ) : (
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+            )}
+            <div className="min-w-0">
+              <div className="text-foreground truncate">
+                {item.label ?? "Tool step"}
+              </div>
+              {item.detail && <div className="truncate text-xs">{item.detail}</div>}
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 };
 
@@ -223,6 +326,7 @@ const ConversationItemComponent = ({
     extensions: [...extensionsForConversation, skillExtension],
     editable: false,
     content: textPart ? textPart.text : "",
+    immediatelyRender: false,
   });
 
   useEffect(() => {

@@ -2,7 +2,6 @@ import {
   streamText,
   stepCountIs,
   tool,
-  readUIMessageStream,
 } from "ai";
 import { z } from "zod";
 
@@ -10,6 +9,10 @@ import { logger } from "~/services/logger.service";
 import { makeModelCall } from "~/lib/model.server";
 import { getConnectedGateways, getGateway } from "~/services/gateway.server";
 import { callGatewayTool } from "../../../websocket";
+import {
+  compactNestedResult,
+  type ToolProgressSink,
+} from "./tool-progress";
 
 // Types for gateway tools (matches schema in database)
 interface GatewayTool {
@@ -84,6 +87,8 @@ function gatewayToolToZodSchema(
 function createDirectGatewayTools(
   gatewayId: string,
   gatewayTools: GatewayTool[],
+  progressSink?: ToolProgressSink,
+  progressParentId?: string,
 ) {
   const tools: Record<string, any> = {};
 
@@ -94,10 +99,21 @@ function createDirectGatewayTools(
       description: gatewayTool.description,
       inputSchema: zodSchema,
       execute: async (params) => {
+        const toolRunId = crypto.randomUUID();
+        const startedAt = Date.now();
         try {
           logger.info(
             `GatewayExplorer: Executing ${gatewayId}/${gatewayTool.name} with params: ${JSON.stringify(params)}`,
           );
+          await progressSink?.({
+            id: `gateway-tool:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: gatewayTool.name,
+            status: "running",
+            detail: gatewayTool.description,
+            elapsedMs: 0,
+          });
 
           const result = await callGatewayTool(
             gatewayId,
@@ -105,6 +121,15 @@ function createDirectGatewayTools(
             params as Record<string, unknown>,
             60000, // 60s timeout
           );
+          await progressSink?.({
+            id: `gateway-tool:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: gatewayTool.name,
+            status: "completed",
+            detail: `Completed ${gatewayTool.name}`,
+            elapsedMs: Date.now() - startedAt,
+          });
 
           return JSON.stringify(result, null, 2);
         } catch (error: unknown) {
@@ -112,6 +137,15 @@ function createDirectGatewayTools(
             error instanceof Error ? error.message : String(error);
           logger.warn(`Gateway tool failed: ${gatewayId}/${gatewayTool.name}`, {
             error,
+          });
+          await progressSink?.({
+            id: `gateway-tool:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: gatewayTool.name,
+            status: "failed",
+            detail: errorMessage,
+            elapsedMs: Date.now() - startedAt,
           });
           return `ERROR: ${errorMessage}`;
         }
@@ -174,6 +208,8 @@ export async function runGatewayExplorer(
   gatewayId: string,
   intent: string,
   abortSignal?: AbortSignal,
+  progressSink?: ToolProgressSink,
+  progressParentId?: string,
 ): Promise<GatewayExplorerResult> {
   const startTime = Date.now();
 
@@ -192,7 +228,12 @@ export async function runGatewayExplorer(
 
   // Create direct tools from the gateway's tool definitions
   // Each gateway tool becomes a real Zod-typed tool the sub-agent can call directly
-  const tools = createDirectGatewayTools(gatewayId, gatewayTools);
+  const tools = createDirectGatewayTools(
+    gatewayId,
+    gatewayTools,
+    progressSink,
+    progressParentId,
+  );
 
   logger.info(
     `GatewayExplorer: Starting stream for gateway "${gateway.name}" with ${gatewayTools.length} tools`,
@@ -335,11 +376,11 @@ USE THIS TOOL to offload tasks like:
           return;
         }
 
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          yield message;
-        }
+        const finalText = await stream.text;
+        yield compactNestedResult(
+          finalText,
+          `Gateway "${gateway.name}" completed, but no final summary was produced.`,
+        );
       },
     });
   });

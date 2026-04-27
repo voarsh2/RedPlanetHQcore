@@ -21,6 +21,7 @@ import {
 import { UserTypeEnum } from "@core/types";
 import React from "react";
 import { HistoryDropdown } from "~/components/conversation/history-dropdown";
+import { ClientOnly } from "remix-utils/client-only";
 
 // Example loader accessing params
 export async function loader({ params, request }: LoaderFunctionArgs) {
@@ -43,6 +44,56 @@ export default function SingleConversation() {
   const { conversation } = useTypedLoaderData<typeof loader>();
   const navigate = useNavigate();
   const { conversationId } = useParams();
+  const conversationTitle = conversation.title || "Untitled";
+
+  return (
+    <>
+      <PageHeader
+        title="Conversation"
+        breadcrumbs={[
+          { label: "Conversations", href: "/home/conversation" },
+          { label: conversationTitle },
+        ]}
+        actions={[
+          {
+            label: "New conversation",
+            icon: <Plus size={14} />,
+            onClick: () => navigate("/home/conversation"),
+            variant: "secondary",
+          },
+        ]}
+        actionsNode={<HistoryDropdown currentConversationId={conversationId} />}
+      />
+
+      <ClientOnly fallback={null}>
+        {() => (
+          <ConversationRuntime
+            conversation={conversation}
+            conversationId={conversationId}
+          />
+        )}
+      </ClientOnly>
+    </>
+  );
+}
+
+function ConversationRuntime({
+  conversation,
+  conversationId,
+}: {
+  conversation: NonNullable<Awaited<ReturnType<typeof getConversationAndHistory>>>;
+  conversationId?: string;
+}) {
+  const loaderMessages = conversation.ConversationHistory.map(
+    (history) =>
+      ({
+        id: history.id,
+        role: history.userType === UserTypeEnum.Agent ? "assistant" : "user",
+        parts: history.parts
+          ? history.parts
+          : [{ text: history.message, type: "text" }],
+      }) as UIMessage & { createdAt: string },
+  );
 
   const {
     sendMessage,
@@ -53,16 +104,7 @@ export default function SingleConversation() {
     addToolApprovalResponse,
   } = useChat({
     id: conversationId, // use the provided chat ID
-    messages: conversation.ConversationHistory.map(
-      (history) =>
-        ({
-          id: history.id,
-          role: history.userType === UserTypeEnum.Agent ? "assistant" : "user",
-          parts: history.parts
-            ? history.parts
-            : [{ text: history.message, type: "text" }],
-        }) as UIMessage & { createdAt: string },
-    ), // load initial messages
+    messages: loaderMessages, // load initial messages
     transport: new DefaultChatTransport({
       api: "/api/v1/conversation",
       prepareSendMessagesRequest({ messages, id }) {
@@ -85,74 +127,66 @@ export default function SingleConversation() {
   });
 
   React.useEffect(() => {
-    if (conversation.ConversationHistory.length === 1) {
-      regenerate();
+    if (conversation.ConversationHistory.length !== 1 || !conversationId) {
+      return;
     }
-  }, []);
 
-  // Check if the last assistant message needs approval (including nested sub-agents)
-  const lastAssistantMessage = [...messages]
-    .reverse()
-    .find((msg) => msg.role === "assistant") as UIMessage | undefined;
+    const regenerateKey = `core:auto-regenerate:${conversationId}`;
+    const now = Date.now();
+    const lastStartedAt = Number(
+      window.sessionStorage.getItem(regenerateKey) || 0,
+    );
+
+    if (lastStartedAt && now - lastStartedAt < 120_000) {
+      return;
+    }
+
+    window.sessionStorage.setItem(regenerateKey, String(now));
+    regenerate();
+  }, [conversation.ConversationHistory.length, conversationId, regenerate]);
+
+  const lastMessage = messages[messages.length - 1] as UIMessage | undefined;
+
+  // Only gate the composer on approvals for the active last assistant turn.
+  // Otherwise a stale approval in older history can lock the input during a new run.
+  const lastAssistantMessage =
+    lastMessage?.role === "assistant" ? lastMessage : undefined;
 
   const needsApproval = lastAssistantMessage?.parts
     ? hasNeedsApprovalDeep(lastAssistantMessage.parts)
     : false;
 
-  if (typeof window === "undefined") {
-    return null;
-  }
-
   return (
-    <>
-      <PageHeader
-        title="Conversation"
-        breadcrumbs={[
-          { label: "Conversations", href: "/home/conversation" },
-          { label: conversation.title || "Untitled" },
-        ]}
-        actions={[
-          {
-            label: "New conversation",
-            icon: <Plus size={14} />,
-            onClick: () => navigate("/home/conversation"),
-            variant: "secondary",
-          },
-        ]}
-        actionsNode={<HistoryDropdown currentConversationId={conversationId} />}
-      />
-
-      <div className="relative flex h-[calc(100vh)] w-full flex-col items-center justify-center overflow-auto md:h-[calc(100vh_-_56px)]">
-        <div className="flex h-full w-full flex-col justify-end overflow-hidden py-4 pb-12 lg:pb-4">
-          <ScrollAreaWithAutoScroll>
-            {messages.map((message: UIMessage, index: number) => {
-              return (
-                <ConversationItem
-                  key={index}
-                  message={message}
-                  addToolApprovalResponse={addToolApprovalResponse}
-                />
-              );
-            })}
-          </ScrollAreaWithAutoScroll>
-
-          <div className="flex w-full flex-col items-center">
-            <div className="w-full max-w-[90ch] px-1 pr-2">
-              <ConversationTextarea
-                className="bg-background-3 w-full border-1 border-gray-300"
-                isLoading={status === "streaming" || status === "submitted"}
-                disabled={needsApproval}
-                onConversationCreated={(message) => {
-                  if (message) {
-                    sendMessage({ text: message });
-                  }
-                }}
-                stop={() => stop()}
+    <div className="relative flex h-[calc(100vh)] w-full flex-col items-center justify-center overflow-auto md:h-[calc(100vh_-_56px)]">
+      <div className="flex h-full w-full flex-col justify-end overflow-hidden py-4 pb-12 lg:pb-4">
+        <ScrollAreaWithAutoScroll>
+          {messages.map((message: UIMessage, index: number) => {
+            return (
+              <ConversationItem
+                key={index}
+                message={message}
+                addToolApprovalResponse={addToolApprovalResponse}
               />
-            </div>
+            );
+          })}
+        </ScrollAreaWithAutoScroll>
+
+        <div className="flex w-full flex-col items-center">
+          <div className="w-full max-w-[90ch] px-1 pr-2">
+            <ConversationTextarea
+              className="bg-background-3 w-full border-1 border-gray-300"
+              isLoading={status === "streaming" || status === "submitted"}
+              disabled={needsApproval}
+              onConversationCreated={(message) => {
+                if (message) {
+                  sendMessage({ text: message });
+                }
+              }}
+              stop={() => stop()}
+            />
           </div>
         </div>
       </div>
-    </>
+    </div>
   );
 }

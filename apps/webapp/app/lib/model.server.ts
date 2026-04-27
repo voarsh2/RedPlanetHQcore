@@ -559,11 +559,31 @@ export async function makeTextModelCall(
   const model = getModelForTask(complexity);
   logger.info(`[Text] complexity: ${complexity}, model: ${model}`);
 
-  const modelInstance = getModel(model);
   const generateTextOptions: any = {};
   const configuredOpenaiApiMode = getConfiguredOpenAIApiMode();
-  const openaiApiMode = getEffectiveOpenAIApiMode(model);
   const useOllamaForChat = env.CHAT_PROVIDER === "ollama";
+  let openaiApiMode = getEffectiveOpenAIApiMode(model);
+  const forceChatCompletionsForProxyTools =
+    shouldUseChatCompletionsForProxyTools({
+      model,
+      options,
+      configuredOpenaiApiMode,
+      effectiveOpenaiApiMode: openaiApiMode,
+      useOllamaForChat,
+    });
+
+  if (forceChatCompletionsForProxyTools) {
+    openaiApiMode = "chat_completions";
+    logger.info("Proxy forced Responses disabled for text tool call", {
+      model,
+      complexity,
+      callSite: telemetry?.callSite,
+      cacheKey,
+      toolCount: Object.keys(options?.tools || {}).length,
+    });
+  }
+
+  const modelInstance = getModel(model, openaiApiMode);
   const promptDiagnostics = buildPromptDiagnostics(messages);
   const promptCacheOptions = buildOpenAIPromptCacheOptions({
     model,
@@ -612,12 +632,23 @@ export async function makeTextModelCall(
     }
   }
 
-  const result = await generateText({
-    model: modelInstance,
-    messages: trimmedMessages,
-    ...options,
-    ...generateTextOptions,
-  });
+  const result = await withProxySdkTimeout(
+    {
+      enabled: shouldApplyProxySdkTimeout(model, useOllamaForChat),
+      operation: "generateText",
+      model,
+      cacheKey,
+      telemetry,
+      promptDiagnostics,
+    },
+    () =>
+      generateText({
+        model: modelInstance,
+        messages: trimmedMessages,
+        ...options,
+        ...generateTextOptions,
+      }),
+  );
 
   const tokenUsage = result.usage
     ? {

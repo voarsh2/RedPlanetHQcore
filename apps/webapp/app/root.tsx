@@ -48,6 +48,7 @@ export const links: LinksFunction = () => [{ rel: "stylesheet", href: styles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const session = await getSession(request.headers.get("cookie"));
+  const requestUrl = new URL(request.url);
   const toastMessage = session.get("toastMessage") as ToastMessage;
   const { getTheme } = await themeSessionResolver(request);
 
@@ -83,6 +84,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       telemetryEnabled,
       appEnv: env.APP_ENV,
       appOrigin: env.APP_ORIGIN,
+      requestHostname: requestUrl.hostname,
     },
     { headers: { "Set-Cookie": await commitSession(session) } },
   );
@@ -100,10 +102,9 @@ export const meta: MetaFunction = ({ data }) => {
     {
       name: "robots",
       content:
-        typeof window === "undefined" ||
-        window.location.hostname !== "core.mysigma.ai"
-          ? "noindex, nofollow"
-          : "index, follow",
+        typedData?.requestHostname === "core.mysigma.ai"
+          ? "index, follow"
+          : "noindex, nofollow",
     },
   ];
 };

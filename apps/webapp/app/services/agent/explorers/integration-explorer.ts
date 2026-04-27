@@ -7,6 +7,7 @@ import {
   handleExecuteIntegrationAction,
   handleGetIntegrationActions,
 } from "~/utils/mcp/integration-operations";
+import { type ToolProgressSink } from "../tool-progress";
 
 export interface Integration {
   slug: string;
@@ -138,6 +139,8 @@ export async function runIntegrationExplorer(
   source: string,
   userId: string,
   abortSignal?: AbortSignal,
+  progressSink?: ToolProgressSink,
+  progressParentId?: string,
 ): Promise<IntegrationExplorerResult> {
   const startTime = Date.now();
 
@@ -177,16 +180,65 @@ export async function runIntegrationExplorer(
         query: z.string().describe("What you want to do"),
       }),
       execute: async ({ accountId, query }) => {
+        const toolRunId = crypto.randomUUID();
+        const startedAt = Date.now();
+        logger.info("IntegrationExplorer: get_integration_actions started", {
+          toolRunId,
+          accountId,
+          query,
+        });
+        await progressSink?.({
+          id: `get-integration-actions:${toolRunId}`,
+          parentId: progressParentId,
+          level: 3,
+          label: "Find integration tools",
+          status: "running",
+          detail: query,
+          elapsedMs: 0,
+        });
         try {
           const actions = await handleGetIntegrationActions({
             accountId,
             query,
             userId,
           });
+          const actionCount = Array.isArray(actions) ? actions.length : undefined;
+          await progressSink?.({
+            id: `get-integration-actions:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: "Find integration tools",
+            status: "completed",
+            detail:
+              actionCount === undefined
+                ? "Found matching integration tools"
+                : `Found ${actionCount} matching integration tool${actionCount === 1 ? "" : "s"}`,
+            elapsedMs: Date.now() - startedAt,
+          });
+          logger.info("IntegrationExplorer: get_integration_actions completed", {
+            toolRunId,
+            accountId,
+            elapsedMs: Date.now() - startedAt,
+            actionCount,
+            resultChars: JSON.stringify(actions).length,
+          });
           // Return full action details including schema
           return JSON.stringify(actions, null, 2);
         } catch (error) {
-          logger.warn(`Failed to get actions for ${accountId}: ${error}`);
+          logger.warn(`Failed to get actions for ${accountId}: ${error}`, {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            error,
+          });
+          await progressSink?.({
+            id: `get-integration-actions:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: "Find integration tools",
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+            elapsedMs: Date.now() - startedAt,
+          });
           return "[]";
         }
       },
@@ -203,11 +255,28 @@ export async function runIntegrationExplorer(
           .describe("Action parameters as JSON string based on inputSchema"),
       }),
       execute: async ({ accountId, action, parameters }) => {
+        const toolRunId = crypto.randomUUID();
+        const startedAt = Date.now();
         try {
           const parsedParams = JSON.parse(parameters);
           logger.info(
             `IntegrationExplorer: Executing ${accountId}/${action} with params: ${JSON.stringify(parsedParams)}`,
+            {
+              toolRunId,
+              accountId,
+              action,
+              parameterChars: parameters.length,
+            },
           );
+          await progressSink?.({
+            id: `execute-integration-action:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: action,
+            status: "running",
+            detail: `Running ${action}`,
+            elapsedMs: 0,
+          });
           const result = await handleExecuteIntegrationAction({
             accountId,
             action,
@@ -215,14 +284,46 @@ export async function runIntegrationExplorer(
             source,
             userId,
           });
+          const resultChars = JSON.stringify(result).length;
+          await progressSink?.({
+            id: `execute-integration-action:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: action,
+            status: "completed",
+            detail: `Completed ${action}`,
+            elapsedMs: Date.now() - startedAt,
+          });
+          logger.info("IntegrationExplorer: execute_integration_action completed", {
+            toolRunId,
+            accountId,
+            action,
+            elapsedMs: Date.now() - startedAt,
+            resultChars,
+          });
           return JSON.stringify(result);
         } catch (error: any) {
           const errorMessage =
             error instanceof Error ? error.message : String(error);
           logger.warn(
             `Integration action failed: ${accountId}/${action}`,
-            error,
+            {
+              toolRunId,
+              accountId,
+              action,
+              elapsedMs: Date.now() - startedAt,
+              error,
+            },
           );
+          await progressSink?.({
+            id: `execute-integration-action:${toolRunId}`,
+            parentId: progressParentId,
+            level: 3,
+            label: action,
+            status: "failed",
+            detail: errorMessage,
+            elapsedMs: Date.now() - startedAt,
+          });
           // Return error details so LLM can retry with corrected parameters
           return `ERROR: ${errorMessage}. Check the inputSchema and retry with corrected parameters.`;
         }
@@ -258,6 +359,12 @@ export async function runIntegrationExplorer(
     undefined,
     { callSite: `core.integration-explorer.${mode}` },
   );
+
+  logger.info("IntegrationExplorer: model stream created", {
+    elapsedMs: Date.now() - startTime,
+    mode,
+    queryChars: query.length,
+  });
 
   return {
     stream,

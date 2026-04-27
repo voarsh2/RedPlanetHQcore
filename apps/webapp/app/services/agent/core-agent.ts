@@ -1,4 +1,4 @@
-import { type Tool, tool, readUIMessageStream, type UIMessage } from "ai";
+import { type Tool, tool } from "ai";
 import { z } from "zod";
 
 import { runOrchestrator } from "./orchestrator";
@@ -6,30 +6,10 @@ import { type SkillRef } from "./types";
 
 import { logger } from "../logger.service";
 import { getReminderTools } from "./tools/reminder-tools";
-
-/**
- * Recursively checks if a message contains any tool part with state "approval-requested"
- */
-const hasApprovalRequested = (message: UIMessage): boolean => {
-  const checkParts = (parts: any[]): boolean => {
-    for (const part of parts) {
-      if (part.state === "approval-requested") {
-        return true;
-      }
-      // Check nested output.parts (sub-agent responses)
-      if (part.output?.parts && Array.isArray(part.output.parts)) {
-        if (checkParts(part.output.parts)) return true;
-      }
-      // Check nested output.content
-      if (part.output?.content && Array.isArray(part.output.content)) {
-        if (checkParts(part.output.content)) return true;
-      }
-    }
-    return false;
-  };
-
-  return message.parts ? checkParts(message.parts) : false;
-};
+import {
+  compactNestedResult,
+  createToolProgressRelay,
+} from "./tool-progress";
 
 export const createTools = async (
   userId: string,
@@ -86,39 +66,86 @@ export const createTools = async (
       }),
 
       execute: async function* ({ query }, { abortSignal }) {
+        const toolRunId = crypto.randomUUID();
+        const progressId = `gather-context:${toolRunId}`;
+        const startedAt = Date.now();
+        const progress = createToolProgressRelay();
         logger.info(`Core brain: Gathering context for: ${query}`);
+        await progress.seed({
+          id: progressId,
+          level: 0,
+          label: "Gather context",
+          status: "running",
+          detail: "Planning the context search",
+          elapsedMs: 0,
+        });
+        yield { progress: progress.snapshot() };
 
-        const { stream } = await runOrchestrator(
-          userId,
-          workspaceId,
-          query,
-          "read",
-          timezone,
-          source,
-          abortSignal,
-          persona,
-          skills,
-        );
+        const { stream, progressId: orchestratorProgressId } =
+          await runOrchestrator(
+            userId,
+            workspaceId,
+            query,
+            "read",
+            timezone,
+            source,
+            abortSignal,
+            persona,
+            skills,
+            progress.sink,
+            progressId,
+          );
+        logger.info("Core brain: gather_context nested stream created", {
+          toolRunId,
+          elapsedMs: Date.now() - startedAt,
+          queryChars: query.length,
+        });
 
-        // Stream the orchestrator's work to the UI
-        let approvalRequested = false;
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          // Skip yielding if we already detected approval (but consume stream to avoid errors)
-          if (approvalRequested) {
-            continue;
+        try {
+          const finalText = yield* progress.streamUntil(stream.text);
+          await progress.sink({
+            id: orchestratorProgressId ?? `orchestrator:${toolRunId}`,
+            parentId: progressId,
+            level: 1,
+            label: "Orchestrator",
+            status: finalText?.trim() ? "completed" : "failed",
+            detail: finalText?.trim()
+              ? "Final handoff summary ready"
+              : "Final handoff summary unavailable",
+            elapsedMs: Date.now() - startedAt,
+          });
+          if (!finalText?.trim()) {
+            logger.warn("Core brain: gather_context produced empty final text", {
+              toolRunId,
+              elapsedMs: Date.now() - startedAt,
+              progressEventCount: progress.snapshot().length,
+            });
           }
-
-          yield message;
-
-          // Check if this message has approval requested
-          if (hasApprovalRequested(message)) {
-            logger.info(
-              `Core brain: Stopping gather_context - approval requested`,
-            );
-            approvalRequested = true;
-          }
+          await progress.sink({
+            id: progressId,
+            level: 0,
+            label: "Gather context",
+            status: "completed",
+            detail: "Context gathering complete",
+            elapsedMs: Date.now() - startedAt,
+          });
+          yield compactNestedResult(
+            finalText,
+            "Context gathering completed.",
+            progress.snapshot(),
+          );
+          logger.info("Core brain: gather_context nested stream closed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            finalTextChars: finalText?.length ?? 0,
+          });
+        } catch (error) {
+          logger.error("Core brain: gather_context nested stream failed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            error,
+          });
+          throw error;
         }
       },
     }),
@@ -140,39 +167,86 @@ export const createTools = async (
           ),
       }),
       execute: async function* ({ action }, { abortSignal }) {
+        const toolRunId = crypto.randomUUID();
+        const progressId = `take-action:${toolRunId}`;
+        const startedAt = Date.now();
+        const progress = createToolProgressRelay();
         logger.info(`Core brain: Taking action: ${action}`);
+        await progress.seed({
+          id: progressId,
+          level: 0,
+          label: "Take action",
+          status: "running",
+          detail: "Planning the requested action",
+          elapsedMs: 0,
+        });
+        yield { progress: progress.snapshot() };
 
-        const { stream } = await runOrchestrator(
-          userId,
-          workspaceId,
-          action,
-          "write",
-          timezone,
-          source,
-          abortSignal,
-          persona,
-          skills,
-        );
+        const { stream, progressId: orchestratorProgressId } =
+          await runOrchestrator(
+            userId,
+            workspaceId,
+            action,
+            "write",
+            timezone,
+            source,
+            abortSignal,
+            persona,
+            skills,
+            progress.sink,
+            progressId,
+          );
+        logger.info("Core brain: take_action nested stream created", {
+          toolRunId,
+          elapsedMs: Date.now() - startedAt,
+          actionChars: action.length,
+        });
 
-        // Stream the orchestrator's work to the UI
-        let approvalRequested = false;
-        for await (const message of readUIMessageStream({
-          stream: stream.toUIMessageStream(),
-        })) {
-          // Skip yielding if we already detected approval (but consume stream to avoid errors)
-          if (approvalRequested) {
-            continue;
+        try {
+          const finalText = yield* progress.streamUntil(stream.text);
+          await progress.sink({
+            id: orchestratorProgressId ?? `orchestrator:${toolRunId}`,
+            parentId: progressId,
+            level: 1,
+            label: "Orchestrator",
+            status: finalText?.trim() ? "completed" : "failed",
+            detail: finalText?.trim()
+              ? "Final handoff summary ready"
+              : "Final handoff summary unavailable",
+            elapsedMs: Date.now() - startedAt,
+          });
+          if (!finalText?.trim()) {
+            logger.warn("Core brain: take_action produced empty final text", {
+              toolRunId,
+              elapsedMs: Date.now() - startedAt,
+              progressEventCount: progress.snapshot().length,
+            });
           }
-
-          yield message;
-
-          // Check if this message has approval requested
-          if (hasApprovalRequested(message)) {
-            logger.info(
-              `Core brain: Stopping take_action - approval requested`,
-            );
-            approvalRequested = true;
-          }
+          await progress.sink({
+            id: progressId,
+            level: 0,
+            label: "Take action",
+            status: "completed",
+            detail: "Action complete",
+            elapsedMs: Date.now() - startedAt,
+          });
+          yield compactNestedResult(
+            finalText,
+            "Action completed.",
+            progress.snapshot(),
+          );
+          logger.info("Core brain: take_action nested stream closed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            finalTextChars: finalText?.length ?? 0,
+          });
+        } catch (error) {
+          logger.error("Core brain: take_action nested stream failed", {
+            toolRunId,
+            elapsedMs: Date.now() - startedAt,
+            error,
+          });
+          throw error;
         }
       },
     });
