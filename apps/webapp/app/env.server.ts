@@ -171,6 +171,11 @@ const EnvironmentSchema = z
     MEMORY_SHADOW_V1_FOR_V3: z
       .string()
       .optional()
+      .default("false")
+      .transform((val) => val === "true" || val === "1"),
+    MEMORY_SEARCH_V2_BROAD_RECALL_BACKSTOP: z
+      .string()
+      .optional()
       .default("true")
       .transform((val) => val === "true" || val === "1"),
 

@@ -254,6 +254,10 @@ export interface SearchV2Options {
   // Reranking
   enableReranking?: boolean;
 
+  // Broad lexical/vector recall backstop for long-tail technical memories
+  enableBroadRecallBackstop?: boolean;
+  broadRecallBackstopLimit?: number;
+
   // Optional workspace override from caller context
   workspaceId?: string;
 

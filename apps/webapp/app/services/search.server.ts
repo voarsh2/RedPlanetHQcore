@@ -91,6 +91,7 @@ export class SearchService {
       sortBy: options.sortBy || "relevance",
       tokenBudget: options.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
       skipEntityExpansion: options.skipEntityExpansion || false,
+      skipRecallLog: options.skipRecallLog || false,
     };
     // Enhance query with LLM to transform keyword soup into semantic query
 
@@ -105,7 +106,7 @@ export class SearchService {
       : await extractEntitiesFromQuery(query, userId, workspaceId, []);
     logger.info(
       opts.skipEntityExpansion
-        ? `Skipped entity extraction for query diagnostic probe`
+        ? `Skipped entity extraction for broad recall search`
         : `Extracted entities ${entities.map((e: EntityNode) => e.name).join(", ")}`,
     );
     const entityEndTime = Date.now();
@@ -412,18 +413,20 @@ export class SearchService {
       filteredResults.map((item) => item.statement),
     );
 
-    this.logRecallAsync(
-      query,
-      userId,
-      limitedEpisodes.length,
-      opts,
-      responseTime,
-      source,
-      tokenCount,
-      searchTimings,
-    ).catch((error) => {
-      logger.error("Failed to log recall event:", error);
-    });
+    if (!opts.skipRecallLog) {
+      this.logRecallAsync(
+        query,
+        userId,
+        limitedEpisodes.length,
+        opts,
+        responseTime,
+        source,
+        tokenCount,
+        searchTimings,
+      ).catch((error) => {
+        logger.error("Failed to log recall event:", error);
+      });
+    }
 
     // Return markdown by default, structured JSON if requested
     if (opts.structured) {

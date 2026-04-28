@@ -2,6 +2,8 @@ import { ProviderFactory, VECTOR_NAMESPACES } from "@core/providers";
 import { logger } from "~/services/logger.service";
 import { applyCohereEpisodeReranking } from "~/services/search/rerank";
 import { prisma } from "~/db.server";
+import { env } from "~/env.server";
+import { SearchService } from "~/services/search.server";
 
 import type {
   HandlerContext,
@@ -16,6 +18,8 @@ import { type EntityNode, type EpisodicNode, type StatementAspect, type Statemen
 type RankedEpisode = EpisodicNode & { relevanceScore?: number };
 import { CohereClientV2 } from "cohere-ai";
 import { getEmbedding } from "~/lib/model.server";
+
+const broadRecallSearchService = new SearchService();
 
 /**
  * Apply Cohere reranking to statements
@@ -528,6 +532,87 @@ async function applyVectorReranking(
   return scored;
 }
 
+function shouldUseBroadRecallBackstop(ctx: HandlerContext): boolean {
+  return (
+    Boolean(ctx.options.query) &&
+    (ctx.options.enableBroadRecallBackstop ??
+      env.MEMORY_SEARCH_V2_BROAD_RECALL_BACKSTOP)
+  );
+}
+
+async function getBroadRecallBackstopEpisodes(
+  ctx: HandlerContext,
+): Promise<EpisodicNode[]> {
+  const query = ctx.options.query;
+  if (!query) return [];
+
+  const startTime = Date.now();
+  const limit = ctx.options.broadRecallBackstopLimit ?? 10;
+
+  try {
+    const result = await broadRecallSearchService.search(
+      query,
+      ctx.userId,
+      ctx.workspaceId,
+      {
+        structured: true,
+        limit,
+        skipEntityExpansion: true,
+        useLLMValidation: false,
+        skipRecallLog: true,
+      },
+      ctx.options.source
+        ? `${ctx.options.source}:search-v2-broad-backstop`
+        : "search-v2-broad-backstop",
+    );
+
+    const episodes =
+      typeof result === "object" && Array.isArray(result.episodes)
+        ? result.episodes
+        : [];
+
+    logger.info(
+      `[SearchV2] Broad recall backstop returned ${episodes.length} episodes in ${Date.now() - startTime}ms`,
+    );
+
+    return episodes as EpisodicNode[];
+  } catch (error) {
+    logger.warn(`[SearchV2] Broad recall backstop failed: ${error}`);
+    return [];
+  }
+}
+
+async function augmentEpisodesWithBroadRecallBackstop(
+  episodes: EpisodicNode[],
+  ctx: HandlerContext,
+): Promise<EpisodicNode[]> {
+  if (!shouldUseBroadRecallBackstop(ctx)) {
+    return episodes;
+  }
+
+  const backstopEpisodes = await getBroadRecallBackstopEpisodes(ctx);
+  if (backstopEpisodes.length === 0) {
+    return episodes;
+  }
+
+  const merged = new Map<string, EpisodicNode>();
+  episodes.forEach((episode) => merged.set(episode.uuid, episode));
+
+  let added = 0;
+  backstopEpisodes.forEach((episode) => {
+    if (!merged.has(episode.uuid)) {
+      merged.set(episode.uuid, episode);
+      added += 1;
+    }
+  });
+
+  logger.info(
+    `[SearchV2] Broad recall backstop added ${added}/${backstopEpisodes.length} episodes (${episodes.length} → ${merged.size})`,
+  );
+
+  return Array.from(merged.values());
+}
+
 /**
  * Apply episode reranking if enabled
  * Uses Cohere when available, falls back to vector similarity
@@ -851,10 +936,14 @@ export async function routeToHandler(
           entities: result.entities,
           entity: result.entities[0]
         }, ctx);
-      }
+    }
 
       // Broad mode - return episodes with entity
-      const rerankedEpisodes = await applyEpisodeReranking(result.episodes, ctx);
+      const augmentedEpisodes = await augmentEpisodesWithBroadRecallBackstop(
+        result.episodes,
+        ctx,
+      );
+      const rerankedEpisodes = await applyEpisodeReranking(augmentedEpisodes, ctx);
       return await normalizeToRecallResult({
         episodes: rerankedEpisodes,
         entities: result.entities,
@@ -864,20 +953,32 @@ export async function routeToHandler(
 
     case "aspect_query": {
       const episodes = await handleAspectQuery(ctx);
-      const rerankedEpisodes = await applyEpisodeReranking(episodes, ctx);
+      const augmentedEpisodes = await augmentEpisodesWithBroadRecallBackstop(
+        episodes,
+        ctx,
+      );
+      const rerankedEpisodes = await applyEpisodeReranking(augmentedEpisodes, ctx);
       return await normalizeToRecallResult({ episodes: rerankedEpisodes }, ctx);
     }
 
     case "temporal": {
       const episodes = await handleTemporal(ctx);
-      const rerankedEpisodes = await applyEpisodeReranking(episodes, ctx);
+      const augmentedEpisodes = await augmentEpisodesWithBroadRecallBackstop(
+        episodes,
+        ctx,
+      );
+      const rerankedEpisodes = await applyEpisodeReranking(augmentedEpisodes, ctx);
       return await normalizeToRecallResult({ episodes: rerankedEpisodes }, ctx);
     }
 
     case "exploratory": {
       const episodes = await handleExploratory(ctx);
+      const augmentedEpisodes = await augmentEpisodesWithBroadRecallBackstop(
+        episodes,
+        ctx,
+      );
       // Lower threshold for exploratory (broader results)
-      const rerankedEpisodes = await applyEpisodeReranking(episodes, ctx, { threshold: 0.05 });
+      const rerankedEpisodes = await applyEpisodeReranking(augmentedEpisodes, ctx, { threshold: 0.05 });
       return await normalizeToRecallResult({ episodes: rerankedEpisodes }, ctx);
     }
 
@@ -890,7 +991,11 @@ export async function routeToHandler(
     default:
       logger.warn(`[Handler] Unknown query type: ${queryType}, using aspect_query`);
       const episodes = await handleAspectQuery(ctx);
-      const rerankedEpisodes = await applyEpisodeReranking(episodes, ctx);
+      const augmentedEpisodes = await augmentEpisodesWithBroadRecallBackstop(
+        episodes,
+        ctx,
+      );
+      const rerankedEpisodes = await applyEpisodeReranking(augmentedEpisodes, ctx);
       return await normalizeToRecallResult({ episodes: rerankedEpisodes }, ctx);
   }
 }
