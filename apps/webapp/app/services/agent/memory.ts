@@ -4,6 +4,7 @@ import { logger } from "~/services/logger.service";
 import { SearchService } from "../search.server";
 import { searchV2 } from "../search-v2";
 import { prisma } from "~/db.server";
+import { env } from "~/env.server";
 
 const searchService = new SearchService();
 
@@ -24,6 +25,44 @@ function hasSearchResults(result: any): boolean {
   return false;
 }
 
+function formatEpisodePreview(episode: any, index: number): string {
+  const content =
+    typeof episode?.content === "string"
+      ? episode.content
+      : typeof episode?.originalContent === "string"
+        ? episode.originalContent
+        : "";
+  const preview = content.replace(/\s+/g, " ").trim().slice(0, 180);
+  const score =
+    typeof episode?.relevanceScore === "number"
+      ? episode.relevanceScore.toFixed(3)
+      : "n/a";
+  const createdAt = episode?.createdAt
+    ? new Date(episode.createdAt).toISOString()
+    : "unknown";
+
+  return [
+    `${index + 1}.`,
+    `uuid=${episode?.uuid || "unknown"}`,
+    `session=${episode?.sessionId || "none"}`,
+    `createdAt=${createdAt}`,
+    `score=${score}`,
+    `compact=${episode?.isCompact ? "yes" : "no"}`,
+    `document=${episode?.isDocument ? "yes" : "no"}`,
+    `preview="${preview}"`,
+  ].join(" ");
+}
+
+function logEpisodePreviews(label: string, episodes: any[]): void {
+  const top = episodes.slice(0, 5);
+  logger.info(
+    `[MemoryAgent] ${label} top episodes (${episodes.length} total):\n` +
+      (top.length > 0
+        ? top.map((episode, index) => formatEpisodePreview(episode, index)).join("\n")
+        : "none")
+  );
+}
+
 /**
  * Memory Agent - Intelligent memory retrieval system
  *
@@ -36,6 +75,7 @@ interface MemoryAgentParams {
   userId: string;
   workspaceId: string;
   source: string;
+  shadowProbe?: boolean;
 }
 
 /**
@@ -118,12 +158,15 @@ export async function memoryAgent({
   userId,
   workspaceId,
   source,
+  shadowProbe = false,
 }: MemoryAgentParams): Promise<{
   episodes: any[];
   facts: any[];
 }> {
   try {
-    logger.info(`[MemoryAgent] Processing intent: "${intent}"`);
+    logger.info(
+      `[MemoryAgent] Processing intent: "${intent}"${shadowProbe ? " (shadow probe mode)" : ""}`,
+    );
 
     // Step 1: Generate queries using LLM
     const { object: queryObject } = await makeStructuredModelCall(
@@ -165,6 +208,8 @@ Generate 1-5 optimized search queries to retrieve relevant context from memory.`
           {
             structured: true,
             limit: 20, // Get top 10 per query
+            skipEntityExpansion: shadowProbe,
+            useLLMValidation: shadowProbe ? false : undefined,
           },
           source,
         )) as any;
@@ -287,16 +332,27 @@ export async function searchMemoryWithAgent(
       select: { version: true },
     });
     const isV3User = workspace?.version === "V3";
+    const shouldShadowV1 = isV3User && env.MEMORY_SHADOW_V1_FOR_V3;
 
     logger.info(
-      `[MemoryAgent] Starting search for intent: "${intent}" (workspace version: ${workspace?.version || "unknown"}, V1 fallback: ${!isV3User})`,
+      `[MemoryAgent] Starting search for intent: "${intent}" (workspace version: ${workspace?.version || "unknown"}, V1 fallback: ${!isV3User}, V1 shadow: ${shouldShadowV1})`,
     );
 
     // For V3 users: V2 only (no V1 fallback - all their data is V2-compatible)
     // For V1/V2 users: parallel V1/V2 with V2-first, V1-fallback
-    const v1Promise = isV3User
-      ? null
-      : memoryAgent({ intent, userId, workspaceId, source });
+    const v1Promise: Promise<{ episodes: any[]; facts: any[] }> | null =
+      isV3User && !shouldShadowV1
+        ? null
+        : memoryAgent({
+            intent,
+            userId,
+            workspaceId,
+            source,
+            shadowProbe: shouldShadowV1,
+          }).catch((err) => {
+            logger.warn(`[MemoryAgent] V1 search failed:`, err.message);
+            return { episodes: [], facts: [] };
+          });
 
     const v2Promise = searchV2(intent, userId, {
       structured: true,
@@ -330,19 +386,34 @@ export async function searchMemoryWithAgent(
       invalidFacts = v2Structured.invalidatedFacts || [];
       entity = v2Structured.entity || null;
       facts = v2Structured.facts || [];
+      if (shouldShadowV1 && v1Promise) {
+        logEpisodePreviews("V2", episodes);
+      }
     } else if (!isV3User && v1Promise) {
       // V2 empty and V1 fallback enabled - wait for V1 (already running in parallel)
       logger.info(`[MemoryAgent] V2 empty, using V1 fallback`);
-      const v1Result = await v1Promise.catch((err) => {
-        logger.error(`[MemoryAgent] V1 also failed:`, err.message);
-        return { episodes: [], facts: [] };
-      });
+      const v1Result = await v1Promise;
       episodes = v1Result.episodes || [];
       invalidFacts = v1Result.facts || [];
       usedVersion = "v1";
     } else {
       // V3 user with empty V2 results - no fallback
       logger.info(`[MemoryAgent] V2 empty, no V1 fallback for V3 user`);
+    }
+
+    if (shouldShadowV1 && v1Promise) {
+      void v1Promise.then((v1Result) => {
+        const v1Episodes = v1Result.episodes || [];
+        const v2EpisodeIds = new Set(episodes.map((episode) => episode.uuid));
+        const overlap = v1Episodes.filter((episode: any) =>
+          v2EpisodeIds.has(episode.uuid)
+        ).length;
+
+        logEpisodePreviews("Shadow V1", v1Episodes);
+        logger.info(
+          `[MemoryAgent] Shadow V1 comparison: v2Episodes=${episodes.length}, v1Episodes=${v1Episodes.length}, overlap=${overlap}`
+        );
+      });
     }
 
     logger.info(

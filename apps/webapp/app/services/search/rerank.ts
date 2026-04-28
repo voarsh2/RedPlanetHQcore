@@ -316,15 +316,19 @@ export async function applyMultiFactorReranking(
   let finalEpisodes = episodes;
 
   const maxEpisodesForLLM = options?.maxEpisodesForLLM || 20;
-  finalEpisodes = await validateEpisodesWithLLMInBatches(
-    query,
-    episodes,
-    maxEpisodesForLLM,
-  );
+  if (options?.useLLMValidation !== false) {
+    finalEpisodes = await validateEpisodesWithLLMInBatches(
+      query,
+      episodes,
+      maxEpisodesForLLM,
+    );
 
-  if (finalEpisodes.length === 0) {
-    logger.info("LLM validation rejected all episodes, returning empty");
-    return [];
+    if (finalEpisodes.length === 0) {
+      logger.info("LLM validation rejected all episodes, returning empty");
+      return [];
+    }
+  } else {
+    logger.info("LLM validation skipped by search options");
   }
 
   // Normalize firstLevelScore to 0-1 range for consistency with Cohere/Ollama providers

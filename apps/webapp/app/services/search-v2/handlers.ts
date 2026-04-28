@@ -111,6 +111,13 @@ function getTemporalDateRange(ctx: HandlerContext): {
   }
 }
 
+function hasExplicitTemporalBounds(range: {
+  startTime?: Date;
+  endTime?: Date;
+}): boolean {
+  return Boolean(range.startTime || range.endTime);
+}
+
 /**
  * Group statements by aspect
  */
@@ -340,15 +347,22 @@ export async function handleTemporal(
   const graphProvider = ProviderFactory.getGraphProvider();
 
   const labelIds = getMatchedLabelIds(ctx.routerOutput, ctx.options.fallbackThreshold || 0.5);
-  const { startTime: temporalStart, endTime: temporalEnd } = getTemporalDateRange(ctx);
+  const temporalRange = getTemporalDateRange(ctx);
+  const { startTime: temporalStart, endTime: temporalEnd } = temporalRange;
   const limit = Math.floor(ctx.options.maxEpisodes || 10);
 
-  // Default to last 7 days if no temporal filter specified
-  const effectiveStart =
-    temporalStart || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  if (!hasExplicitTemporalBounds(temporalRange)) {
+    logger.info(
+      "[Handler:temporal] No explicit temporal bounds; falling back to non-temporal retrieval"
+    );
+
+    return ctx.routerOutput.aspects.length > 0
+      ? await handleAspectQuery(ctx)
+      : await handleExploratory(ctx);
+  }
 
   logger.info(
-    `[Handler:temporal] Time range: ${effectiveStart.toISOString()} - ${temporalEnd?.toISOString() || "now"}`
+    `[Handler:temporal] Time range: ${temporalStart?.toISOString() || "unbounded"} - ${temporalEnd?.toISOString() || "unbounded"}`
   );
 
   // Get episodes within time range using graph provider method
@@ -357,7 +371,7 @@ export async function handleTemporal(
     workspaceId: ctx.workspaceId,
     labelIds,
     aspects: ctx.routerOutput.aspects,
-    startTime: effectiveStart,
+    startTime: temporalStart,
     endTime: temporalEnd,
     maxEpisodes: limit,
   });

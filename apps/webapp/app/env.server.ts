@@ -168,6 +168,11 @@ const EnvironmentSchema = z
     COHERE_SCORE_THRESHOLD: z.string().default("0.3"),
     OLLAMA_RERANK_MODEL: z.string().default("dengcao/Qwen3-Reranker-8B:Q4_K_M"),
     OLLAMA_SCORE_THRESHOLD: z.string().default("0.3"),
+    MEMORY_SHADOW_V1_FOR_V3: z
+      .string()
+      .optional()
+      .default("true")
+      .transform((val) => val === "true" || val === "1"),
 
     AWS_ACCESS_KEY_ID: z.string().optional(),
     AWS_SECRET_ACCESS_KEY: z.string().optional(),

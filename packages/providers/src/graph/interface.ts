@@ -789,7 +789,7 @@ export interface IGraphProvider {
     workspaceId: string;
     labelIds: string[];
     aspects: string[];
-    startTime: Date;
+    startTime?: Date;
     endTime?: Date;
     maxEpisodes: number;
   }): Promise<EpisodicNode[]>;

@@ -22,6 +22,7 @@ export interface SearchOptions {
   maxEpisodesForLLM?: number; // Maximum episodes to send for LLM validation (default: 20)
   sortBy?: "relevance" | "recency"; // Sort results by relevance (default) or recency (newest first)
   tokenBudget?: number; // Token budget for recall output (default: 10000). Drops least relevant episodes from tail until total tokens <= budget
+  skipEntityExpansion?: boolean; // Diagnostic mode: skip entity extraction, BFS, and episode graph traversal
 }
 
 /**

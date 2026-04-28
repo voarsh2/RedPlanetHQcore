@@ -85,11 +85,12 @@ export class SearchService {
       labelIds: options.labelIds || [],
       adaptiveFiltering: options.adaptiveFiltering || false,
       structured: options.structured || false,
-      useLLMValidation: options.useLLMValidation || true,
+      useLLMValidation: options.useLLMValidation ?? true,
       qualityThreshold: options.qualityThreshold || 0.3,
       maxEpisodesForLLM: options.maxEpisodesForLLM || 20,
       sortBy: options.sortBy || "relevance",
       tokenBudget: options.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
+      skipEntityExpansion: options.skipEntityExpansion || false,
     };
     // Enhance query with LLM to transform keyword soup into semantic query
 
@@ -98,10 +99,14 @@ export class SearchService {
     logger.info(`Query vectorization: ${vectorEndTime - startTime}ms`);
 
     // Note: We still need to extract entities from graph for Episode Graph search
-    // The LLM entities are just strings, we need EntityNode objects from the graph
-    const entities = await extractEntitiesFromQuery(query, userId, workspaceId, []);
+    // The LLM entities are just strings, we need EntityNode objects from the graph.
+    const entities = opts.skipEntityExpansion
+      ? []
+      : await extractEntitiesFromQuery(query, userId, workspaceId, []);
     logger.info(
-      `Extracted entities ${entities.map((e: EntityNode) => e.name).join(", ")}`,
+      opts.skipEntityExpansion
+        ? `Skipped entity extraction for query diagnostic probe`
+        : `Extracted entities ${entities.map((e: EntityNode) => e.name).join(", ")}`,
     );
     const entityEndTime = Date.now();
     logger.info(`Entity extraction: ${entityEndTime - vectorEndTime}ms`);
@@ -133,20 +138,42 @@ export class SearchService {
         logger.info(`Vector search completed in ${searchTimings.vector}ms`);
         return r;
       }),
-      performBfsSearch(query, queryVector, userId, workspaceId, entities, opts).then((r) => {
-        searchTimings.bfs = Date.now() - searchStartTime;
-        logger.info(`BFS search completed in ${searchTimings.bfs}ms`);
-        return r;
-      }),
-      performEpisodeGraphSearch(entities, queryVector, userId, workspaceId, opts).then(
-        (r) => {
-          searchTimings.episodeGraph = Date.now() - searchStartTime;
-          logger.info(
-            `Episode graph search completed in ${searchTimings.episodeGraph}ms`,
-          );
-          return r;
-        },
-      ),
+      opts.skipEntityExpansion
+        ? Promise.resolve([]).then((r) => {
+            searchTimings.bfs = Date.now() - searchStartTime;
+            logger.info(`BFS search skipped in ${searchTimings.bfs}ms`);
+            return r;
+          })
+        : performBfsSearch(query, queryVector, userId, workspaceId, entities, opts).then(
+            (r) => {
+              searchTimings.bfs = Date.now() - searchStartTime;
+              logger.info(`BFS search completed in ${searchTimings.bfs}ms`);
+              return r;
+            },
+          ),
+      opts.skipEntityExpansion
+        ? Promise.resolve([]).then((r) => {
+            searchTimings.episodeGraph = Date.now() - searchStartTime;
+            logger.info(
+              `Episode graph search skipped in ${searchTimings.episodeGraph}ms`,
+            );
+            return r;
+          })
+        : performEpisodeGraphSearch(
+            entities,
+            queryVector,
+            userId,
+            workspaceId,
+            opts,
+          ).then(
+            (r) => {
+              searchTimings.episodeGraph = Date.now() - searchStartTime;
+              logger.info(
+                `Episode graph search completed in ${searchTimings.episodeGraph}ms`,
+              );
+              return r;
+            },
+          ),
       performEpisodeVectorSearch(queryVector, userId, workspaceId, opts).then((r) => {
         searchTimings.episodeVector = Date.now() - searchStartTime;
         logger.info(

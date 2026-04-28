@@ -117,23 +117,50 @@ export function createSearchV2Methods(core: Neo4jCore) {
       workspaceId?: string;
       labelIds: string[];
       aspects: string[];
-      startTime: Date;
+      startTime?: Date;
       endTime?: Date;
       maxEpisodes: number;
     }): Promise<EpisodicNode[]> {
       const wsFilter = params.workspaceId ? ", workspaceId: $workspaceId" : "";
 
-      const query = `
-                MATCH (e:Episode {userId: $userId${wsFilter}})-[:HAS_PROVENANCE]->(s:Statement)
-                WHERE (
-                (s.validAt >= datetime($startTime) ${params.endTime ? "AND s.validAt <= datetime($endTime)" : ""})
+      let temporalCondition = "";
+      if (params.startTime && params.endTime) {
+        temporalCondition = `
+                AND (
+                (s.validAt >= datetime($startTime) AND s.validAt <= datetime($endTime))
                 OR
                 (s.aspect = 'Event'
                 AND s.attributes IS NOT NULL
                 AND apoc.convert.fromJsonMap(s.attributes).event_date IS NOT NULL
                 AND datetime(apoc.convert.fromJsonMap(s.attributes).event_date) >= datetime($startTime)
-                ${params.endTime ? "AND datetime(apoc.convert.fromJsonMap(s.attributes).event_date) <= datetime($endTime)" : ""})
-                )
+                AND datetime(apoc.convert.fromJsonMap(s.attributes).event_date) <= datetime($endTime))
+                )`;
+      } else if (params.startTime) {
+        temporalCondition = `
+                AND (
+                (s.validAt >= datetime($startTime))
+                OR
+                (s.aspect = 'Event'
+                AND s.attributes IS NOT NULL
+                AND apoc.convert.fromJsonMap(s.attributes).event_date IS NOT NULL
+                AND datetime(apoc.convert.fromJsonMap(s.attributes).event_date) >= datetime($startTime))
+                )`;
+      } else if (params.endTime) {
+        temporalCondition = `
+                AND (
+                (s.validAt <= datetime($endTime))
+                OR
+                (s.aspect = 'Event'
+                AND s.attributes IS NOT NULL
+                AND apoc.convert.fromJsonMap(s.attributes).event_date IS NOT NULL
+                AND datetime(apoc.convert.fromJsonMap(s.attributes).event_date) <= datetime($endTime))
+                )`;
+      }
+
+      const query = `
+                MATCH (e:Episode {userId: $userId${wsFilter}})-[:HAS_PROVENANCE]->(s:Statement)
+                WHERE TRUE
+                ${temporalCondition}
                 ${params.labelIds.length > 0 ? "AND ANY(lid IN e.labelIds WHERE lid IN $labelIds)" : ""}
                 ${params.aspects.length > 0 ? "AND s.aspect IN $aspects" : ""}
                 AND (s.invalidAt IS NULL OR s.invalidAt > datetime())
@@ -150,7 +177,7 @@ export function createSearchV2Methods(core: Neo4jCore) {
         ...(params.workspaceId && { workspaceId: params.workspaceId }),
         labelIds: params.labelIds,
         aspects: params.aspects,
-        startTime: params.startTime.toISOString(),
+        startTime: params.startTime?.toISOString() || null,
         endTime: params.endTime?.toISOString() || null,
       });
 
